@@ -10,11 +10,27 @@ class FileEdit(BaseModel):
 
     path: str = Field(description="Relative file path to modify (must exist in repo context)")
     change_summary: str = Field(description="One sentence describing what this edit does")
+    source_lines: str = Field(
+        description=(
+            "Line range in the numbered file listing where find_snippet was located, "
+            "e.g. '23-27'. Used to confirm the snippet was copied from a specific "
+            "location, not reconstructed from memory. Format: 'START-END'."
+        ),
+        default="unknown",
+    )
     find_snippet: str = Field(
-        description="Exact verbatim text to find in the file — must be a substring of the actual file content"
+        description=(
+            "Exact verbatim text copied character-for-character from the numbered file "
+            "listing above (WITHOUT the 'NNN | ' line-number prefix). "
+            "Must be a contiguous block from a single location — never merge lines "
+            "from different parts of the file."
+        )
     )
     replace_with: str = Field(
-        description="Replacement text — the minimal change that fixes the issue"
+        description=(
+            "Minimal replacement for find_snippet. Only the lines needed to fix the bug "
+            "should differ from find_snippet. Preserve indentation and style exactly."
+        )
     )
 
 

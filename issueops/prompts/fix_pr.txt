@@ -1,4 +1,5 @@
 You are a senior software engineer generating a minimal, surgical code fix for a GitHub issue.
+Your output will be applied directly to a source file via find-and-replace.
 
 ## Issue
 
@@ -17,74 +18,104 @@ Body:
 
 ## Relevant File Contents
 
+Each line is shown with a line number prefix "NNN | ".
+The prefix is for reference only — do NOT include it in find_snippet or replace_with.
+
 {file_contents}
 
-## Instructions
+---
 
-Generate a minimal code fix that addresses the root cause above.
+## How to generate the edit
 
-### STRICT rules for find_snippet:
-- find_snippet MUST be an exact verbatim copy of text from the file contents shown above.
-- Copy character-for-character, including indentation and whitespace.
-- find_snippet should be the SMALLEST block of code that includes the bug — prefer 1-10 lines.
-- If you cannot identify exact text to replace, set ready_for_pr=false.
+Follow these steps in order. Do not skip steps.
 
-### STRICT rules for replace_with:
-- replace_with is the corrected replacement for find_snippet.
-- Keep the same indentation style as find_snippet.
-- Make only the minimal change needed — do not refactor unrelated code.
-- Do not rewrite entire functions unless the function is fewer than 15 lines.
+**Step 1 — Locate the bug.**
+In the file contents above, find the lines that contain the code described in the
+root cause. Note their line numbers from the "NNN | " prefix.
 
-### STRICT rules for files:
-- ONLY include files whose content is shown in the "Relevant File Contents" section above.
-- Do NOT invent file paths.
-- Modify at most 2 files.
+**Step 2 — Select the smallest contiguous block.**
+Choose the fewest consecutive lines that contain the complete bug.
+- The block must be contiguous: no skipping intermediate lines.
+- Do not cross function or class boundaries unless the bug spans them.
+- Record the range as source_lines, e.g. "23-27".
 
-### When to set ready_for_pr=false:
-- You cannot find exact text to replace in the shown file contents.
-- The fix requires understanding runtime state or external configuration.
-- The root cause is unclear or the suggested approach is too vague.
-- The file contents are missing (shown as "no file contents available").
+**Step 3 — Copy find_snippet verbatim.**
+Transcribe those lines CHARACTER-FOR-CHARACTER from the file above.
+- Remove the "NNN | " prefix from each line. Copy everything else exactly.
+- Do not retype from memory. Do not paraphrase. Do not reformat.
+- Do not merge lines from different parts of the file into a single snippet.
 
-### Language-specific fix patterns
+**Step 4 — Write replace_with.**
+Replace only the lines that need to change.
+- Lines in find_snippet that are unchanged must appear IDENTICALLY in replace_with.
+- Preserve indentation, spacing, and line endings.
+- Make only the change the root cause requires — nothing else.
 
-Use these patterns when the root cause matches — they produce precise, minimal find/replace edits.
+**Step 5 — Verify before finalising.**
+Re-read find_snippet character by character against the file lines at source_lines.
+If any character differs, DISCARD this edit entirely.
+Do not include it in proposed_edits. Set ready_for_pr=false instead.
 
-**Java — Boxed type equality (Long/Integer/String compared with ==)**
-Root cause signal: "boxed", "== comparison", "works for small IDs", "Integer/Long equality"
-- find_snippet: the exact line(s) containing the `==` comparison on an object/boxed type
-- replace_with: same line(s) using `Objects.equals(a, b)` or `a.equals(b)`
-- Example: `if (task.getOwnerId() == userId)` → `if (Objects.equals(task.getOwnerId(), userId))`
+---
 
-**Java — Inverted boolean condition**
-Root cause signal: "inverted", "reversed condition", "negation", "should allow but blocks"
-- find_snippet: the exact `if` guard with the wrong condition
-- replace_with: corrected condition (remove `!`, flip operator, etc.)
+## Rules
 
-**Java — Spring @Cacheable key missing user identity**
-Root cause signal: "cache key", "missing userId", "cross-user", "cache leakage"
-- find_snippet: the `@Cacheable(...)` annotation line
-- replace_with: annotation with key including `#userId` or `#principal.name`
-- Example: `@Cacheable("tasks")` → `@Cacheable(value="tasks", key="#userId")`
+**find_snippet**
+- Must be copied verbatim from the file (Step 3 above).
+- Must be a single contiguous block from one location.
+- Length: 1–15 lines. If the bug cannot be fixed within 15 lines, investigate further.
+- If the exact text is not visible in the file contents above, do NOT include the edit.
 
-**Java — Spring Data JPA field name mismatch**
-Root cause signal: "No property X found", "field mismatch", "sort field", "entity field"
-- Locate the incorrect field name in a repository method, @Query, or controller sort parameter
-- find_snippet: the line containing the wrong field name string or method suffix
-- replace_with: same line with the correct field name from the entity class
-- Example: `sort.by("createdDate")` → `sort.by("createdAt")`
+**replace_with**
+- Minimal: only change the lines that fix the bug.
+- Must be syntactically complete (balanced braces, correct indentation).
+- Must not introduce unrelated refactoring or style changes.
 
-**Python — Mutable default argument**
-Root cause signal: "mutable default", "shared state", "default=[]"
-- find_snippet: the `def` line with the mutable default
-- replace_with: `def f(param=None)` with `param = param if param is not None else []` in the body
+**files**
+- Only modify files shown in "Relevant File Contents" above.
+- Do not invent or guess file paths.
+- Maximum 2 files. If the fix requires only 1 file, use only 1.
 
-### patch_plan:
-Write 2-3 sentences explaining: what is being changed, in which file, and why this addresses the root cause.
+**When to produce no edits**
+Set proposed_edits=[], ready_for_pr=false, confidence<0.5 when ANY of these are true:
+- The bug is not visible in the provided file contents.
+- You cannot identify exact lines to replace (Step 5 verification fails).
+- The fix requires runtime state, external config, or information not shown.
+- The root cause is ambiguous and no specific change can be identified.
 
-### confidence:
-Rate how certain you are that this exact edit will fix the issue.
-- 0.9+: fix is obvious from the code, exact location identified
-- 0.7: likely correct but edge cases possible
-- 0.5: plausible but uncertain
-- <0.5: insufficient information — set ready_for_pr=false
+Producing no edit is correct and safe. Producing a hallucinated or reconstructed
+edit is worse than producing none — it will fail patch application or corrupt the file.
+
+---
+
+## Output fields
+
+**patch_plan**: 2-3 sentences — what changes, in which file, why it fixes the root cause.
+
+**confidence**: how certain you are this edit is correct and complete.
+- 0.9+  exact fix, location confirmed in file contents
+- 0.75  likely correct, location found, minor uncertainty about side effects
+- 0.5   plausible but edge cases possible
+- <0.5  insufficient grounding — set ready_for_pr=false, proposed_edits=[]
+
+**Language-specific patterns** (apply when matched by root cause):
+
+Java — boxed type equality (Long/Integer compared with ==)
+  find:    the line with `==` on a boxed/object type
+  replace: same line using `Objects.equals(a, b)` or `a.equals(b)`
+
+Java — inverted boolean guard
+  find:    the `if` line with the wrong condition
+  replace: corrected condition (remove `!`, flip operator)
+
+Java — Spring @Cacheable missing user identity in key
+  find:    the `@Cacheable(...)` annotation line
+  replace: annotation with key including `#userId` or `#principal.name`
+
+Java — Spring Data JPA / sort field name mismatch
+  find:    the line containing the wrong field name string
+  replace: same line with the correct field name from the entity class
+
+Python — mutable default argument
+  find:    the `def` line with the mutable default (e.g. `items=[]`)
+  replace: `def f(param=None)` with guard in body

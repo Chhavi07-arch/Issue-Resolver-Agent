@@ -5,6 +5,7 @@ import logging
 from typing import Optional
 
 from issueops.schemas.fix import FileEdit
+from issueops.tools.patch_match import find_snippet
 
 logger = logging.getLogger(__name__)
 
@@ -14,12 +15,25 @@ def apply_edit(original_content: str, edit: FileEdit) -> tuple[str, bool]:
 
     Returns (patched_content, was_applied).
     Replaces only the first occurrence to keep edits surgical.
+
+    Matching is whitespace-tolerant: tries exact → normalized-whitespace →
+    fuzzy (difflib) in order.  The replacement always targets the verbatim
+    original text so no accidental normalization is introduced into the file.
     """
-    if edit.find_snippet not in original_content:
-        logger.debug("patch_builder: snippet not found in %s", edit.path)
+    match = find_snippet(edit.find_snippet, original_content)
+    if match is None:
+        logger.debug(
+            "patch_builder: snippet not found in %s (tried exact/normalized/fuzzy)",
+            edit.path,
+        )
         return original_content, False
 
-    patched = original_content.replace(edit.find_snippet, edit.replace_with, 1)
+    if match.method != "exact":
+        logger.info(
+            "patch_builder: applied via %s match for %s", match.method, edit.path
+        )
+
+    patched = original_content.replace(match.matched_text, edit.replace_with, 1)
     return patched, True
 
 

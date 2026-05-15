@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from issueops.schemas.fix import FileEdit, FixResult
+from issueops.tools.patch_match import find_snippet
 
 logger = logging.getLogger(__name__)
 
@@ -57,13 +58,22 @@ def validate_edit(edit: FileEdit, file_content: Optional[str]) -> EditValidation
         )
         return result
 
-    if edit.find_snippet not in file_content:
+    match = find_snippet(edit.find_snippet, file_content)
+    if match is None:
         result.valid = False
         result.add(
-            f"{edit.path}: find_snippet not found in file content — "
-            "snippet may be wrong or file may be truncated"
+            f"{edit.path}: find_snippet not found in file content "
+            "(tried exact match, whitespace-normalized match, and fuzzy match) — "
+            "snippet may reference the wrong code block, or the file was truncated "
+            "before the relevant section"
         )
         return result
+
+    if match.method != "exact":
+        logger.info(
+            "patch_validator: %s — accepted via %s match (whitespace tolerance)",
+            edit.path, match.method,
+        )
 
     return result
 

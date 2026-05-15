@@ -18,6 +18,7 @@ from issueops.schemas.fix import FileEdit, FixResult
 from issueops.tools import github as gh
 from issueops.tools.patch_builder import apply_edit_to_content, apply_and_diff
 from issueops.tools.patch_validator import diff_size_ok, validate_fix_result
+from issueops.tools.patch_syntax import check_brace_balance, validate_replacement_syntax
 from issueops.workflows.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -38,8 +39,24 @@ def _format_file_contents(repo_context: dict[str, Any]) -> str:
     parts: list[str] = []
     for path, content in list(snippets.items())[:2]:
         truncated = content[:_FILE_CONTENT_LIMIT]
-        note = "\n...[truncated — fix must target lines shown above]" if len(content) > _FILE_CONTENT_LIMIT else ""
-        parts.append(f"### {path}\n```\n{truncated}{note}\n```")
+        is_truncated = len(content) > _FILE_CONTENT_LIMIT
+
+        # Line numbers give the LLM a concrete localization anchor — the model
+        # must cite source_lines (e.g. "23-27") before copying find_snippet,
+        # which prevents reconstruction from memory.
+        # The "NNN | " prefix is explicitly excluded from find_snippet/replace_with.
+        numbered_lines = [
+            f"{i:4d} | {line}"
+            for i, line in enumerate(truncated.splitlines(), start=1)
+        ]
+        numbered = "\n".join(numbered_lines)
+
+        footer = (
+            f"\n... [file truncated — shown lines 1-{len(numbered_lines)} only; "
+            "fix must target lines shown above]"
+        ) if is_truncated else ""
+
+        parts.append(f"### {path}\n```\n{numbered}{footer}\n```")
     return "\n\n".join(parts)
 
 
@@ -87,6 +104,17 @@ def _run_validation(
             content = file_snippets.get(edit.path)
             if content is None:
                 continue
+
+            # Syntax / structural gate — runs before any file I/O
+            syntax_ok, syntax_note = validate_replacement_syntax(edit)
+            if not syntax_ok:
+                all_valid = False
+                validation_issues.append(f"{edit.path}: {syntax_note}")
+                logger.warning(
+                    "patch_syntax rejected edit for %s: %s", edit.path, syntax_note
+                )
+                continue
+
             diff, applied = apply_and_diff(content, edit)
             if not applied or diff is None:
                 all_valid = False
@@ -97,9 +125,22 @@ def _run_validation(
             if not size_ok:
                 all_valid = False
                 validation_issues.append(f"{edit.path}: {size_note}")
-            else:
-                diffs[edit.path] = diff
-                logger.info("patch_builder: diff built for %s (%s)", edit.path, size_note)
+                continue
+
+            # Post-apply brace balance — verify the patched file is still coherent
+            patched, _ = apply_edit_to_content(content, edit)
+            balance_ok, balance_note = check_brace_balance(content, patched, edit.path)
+            if not balance_ok:
+                all_valid = False
+                validation_issues.append(f"{edit.path}: {balance_note}")
+                logger.warning(
+                    "patch_syntax post-apply balance check failed for %s: %s",
+                    edit.path, balance_note,
+                )
+                continue
+
+            diffs[edit.path] = diff
+            logger.info("patch_builder: diff built for %s (%s)", edit.path, size_note)
 
     final_notes = notes
     if validation_issues:

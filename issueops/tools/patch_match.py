@@ -1,0 +1,236 @@
+"""Whitespace-tolerant snippet matching for patch validation and application.
+
+Three progressive levels, each attempted before falling to the next:
+
+  Level 1 — exact, line-boundary:
+      verbatim substring match, but only where the snippet starts at position 0
+      or immediately after a newline.  Prevents a 2-space snippet from matching
+      inside an 8-space indented line (which would corrupt indentation on apply).
+
+  Level 2 — normalized:
+      strip leading/trailing whitespace per line, collapse internal whitespace
+      runs to a single space, then require exact line-sequence equality.
+      Handles indentation changes, trailing spaces, and CRLF vs LF.
+
+  Level 3 — fuzzy:
+      difflib SequenceMatcher on the CHARACTER-level joined normalized text of
+      sliding content windows.  Character-level (not line-level) comparison
+      correctly scores small snippets where one line has minor token differences
+      (e.g. "a==b" vs "a == b") without inflating scores on structurally
+      different code.
+
+      Only attempted when the snippet has >= _FUZZY_MIN_LINES non-blank lines.
+      Only accepted when ratio >= _FUZZY_MIN_RATIO.
+
+Safety invariants:
+  - Levels 1 and 2 require structural equality — no approximation.
+  - Level 3 uses a conservative ratio threshold plus a minimum-lines guard.
+  - All levels return the ORIGINAL (unnormalized) matched text so callers
+    can do a literal str.replace() that never introduces normalization
+    artifacts into the file.
+  - Only the first match is ever returned (surgical edits stay surgical).
+"""
+
+import difflib
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# ─── Tuning constants ────────────────────────────────────────────────────────
+
+# Fuzzy match: reject unless normalized character similarity meets this threshold.
+# 0.85 is conservative — two structurally different code blocks rarely reach it.
+_FUZZY_MIN_RATIO: float = 0.85
+
+# Fuzzy match: only attempted when snippet has at least this many non-blank lines.
+# Small snippets have too little signal to distinguish false positives.
+_FUZZY_MIN_LINES: int = 3
+
+# Fuzzy match: try window sizes snippet_lines ± this slack to absorb blank-line variance.
+_FUZZY_SLACK: int = 2
+
+
+# ─── Result type ─────────────────────────────────────────────────────────────
+
+class SnippetMatch:
+    __slots__ = ("matched_text", "start_line", "end_line", "method")
+
+    def __init__(self, matched_text: str, start_line: int, end_line: int, method: str):
+        self.matched_text = matched_text
+        self.start_line = start_line
+        self.end_line = end_line
+        self.method = method
+
+    def __repr__(self) -> str:
+        return (
+            f"SnippetMatch(method={self.method!r}, lines={self.start_line}-{self.end_line},"
+            f" len={len(self.matched_text)})"
+        )
+
+
+# ─── Normalization helpers ────────────────────────────────────────────────────
+
+def _norm(line: str) -> str:
+    """Strip leading/trailing whitespace and collapse internal runs to one space."""
+    return " ".join(line.split())
+
+
+# ─── Public API ──────────────────────────────────────────────────────────────
+
+def find_snippet(snippet: str, content: str) -> Optional[SnippetMatch]:
+    """Find snippet in content with progressive whitespace tolerance.
+
+    Returns a SnippetMatch whose .matched_text is the verbatim substring of
+    content corresponding to the snippet, or None if no match is found at any
+    level.
+
+    Use matched_text as the first argument to str.replace() so edits always
+    target original text, never normalized text.
+    """
+    if not snippet or not content:
+        return None
+
+    # ── Level 1: exact at line boundary ──────────────────────────────────────
+    match = _exact_match(snippet, content)
+    if match is not None:
+        return match
+
+    # ── Level 2: whitespace-normalized line match ─────────────────────────────
+    match = _normalized_match(snippet, content)
+    if match is not None:
+        logger.info(
+            "patch_match: normalized match at lines %d-%d "
+            "(exact match failed — whitespace difference)",
+            match.start_line, match.end_line,
+        )
+        return match
+
+    # ── Level 3: fuzzy (character-level difflib) ──────────────────────────────
+    match = _fuzzy_match(snippet, content)
+    return match
+
+
+# ─── Level 1: exact, line-boundary ───────────────────────────────────────────
+
+def _exact_match(snippet: str, content: str) -> Optional[SnippetMatch]:
+    """Return first occurrence of snippet that starts at position 0 or after \\n.
+
+    The line-boundary requirement prevents a less-indented snippet from matching
+    mid-way through a more-indented line (e.g. '  if ...' matching inside
+    '        if ...' at offset 6), which would corrupt indentation on apply.
+    """
+    search_from = 0
+    while True:
+        idx = content.find(snippet, search_from)
+        if idx == -1:
+            return None
+        if idx == 0 or content[idx - 1] == "\n":
+            pre = content[:idx]
+            start = pre.count("\n")
+            end = start + snippet.count("\n") + (0 if snippet.endswith("\n") else 1)
+            return SnippetMatch(snippet, start, end, "exact")
+        # Occurrence is mid-line — try next
+        search_from = idx + 1
+
+
+# ─── Level 2: normalized ─────────────────────────────────────────────────────
+
+def _normalized_match(snippet: str, content: str) -> Optional[SnippetMatch]:
+    """Exact match on per-line normalized text.
+
+    Leading/trailing blank lines of the snippet are trimmed before comparison —
+    they carry no structural meaning and LLMs frequently omit/add them.
+    """
+    content_lines_raw = content.splitlines(keepends=True)
+    norm_content = [_norm(l) for l in content.splitlines()]
+
+    snip_norm = [_norm(l) for l in snippet.splitlines()]
+
+    # Trim surrounding blank lines from snippet
+    lo = 0
+    while lo < len(snip_norm) and not snip_norm[lo]:
+        lo += 1
+    hi = len(snip_norm)
+    while hi > lo and not snip_norm[hi - 1]:
+        hi -= 1
+    trimmed = snip_norm[lo:hi]
+
+    if not trimmed:
+        return None
+
+    n = len(trimmed)
+    for i in range(len(norm_content) - n + 1):
+        if norm_content[i : i + n] == trimmed:
+            matched_text = "".join(content_lines_raw[i : i + n])
+            return SnippetMatch(matched_text, i, i + n, "normalized")
+
+    return None
+
+
+# ─── Level 3: fuzzy (character-level) ────────────────────────────────────────
+
+def _fuzzy_match(snippet: str, content: str) -> Optional[SnippetMatch]:
+    """Character-level difflib fuzzy match.
+
+    Joins normalized non-blank lines into a single string for comparison.
+    Character-level scoring (vs line-level) correctly handles small snippets
+    where one line has minor token differences (e.g. spacing around operators)
+    — a 1-line change in a 4-line snippet registers ~0.95 at char level but
+    only ~0.75 at list-element level.
+
+    A sliding window of size snippet_lines ± _FUZZY_SLACK is used so that
+    minor blank-line count differences between LLM output and actual file
+    do not block a valid match.
+    """
+    snip_nb = [_norm(l) for l in snippet.splitlines() if l.strip()]
+
+    if len(snip_nb) < _FUZZY_MIN_LINES:
+        logger.debug(
+            "patch_match: fuzzy skipped — only %d non-blank lines in snippet (min %d)",
+            len(snip_nb), _FUZZY_MIN_LINES,
+        )
+        return None
+
+    snip_joined = "\n".join(snip_nb)
+
+    content_lines_raw = content.splitlines(keepends=True)
+    content_norm = [_norm(l) for l in content.splitlines()]
+    total_lines = len(content_norm)
+    base_n = len(snippet.splitlines())  # expected window height
+
+    best_ratio = 0.0
+    best_start = -1
+    best_end = -1
+
+    seen_deltas: set[int] = set()
+    for slack in range(_FUZZY_SLACK + 1):
+        for delta in ([0] if slack == 0 else [slack, -slack]):
+            if delta in seen_deltas:
+                continue
+            seen_deltas.add(delta)
+            win_size = base_n + delta
+            if win_size <= 0 or win_size > total_lines:
+                continue
+            for i in range(total_lines - win_size + 1):
+                window_nb = [l for l in content_norm[i : i + win_size] if l]
+                window_joined = "\n".join(window_nb)
+                ratio = difflib.SequenceMatcher(None, snip_joined, window_joined).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start = i
+                    best_end = i + win_size
+
+    if best_ratio >= _FUZZY_MIN_RATIO and best_start >= 0:
+        matched_text = "".join(content_lines_raw[best_start:best_end])
+        logger.info(
+            "patch_match: fuzzy match at lines %d-%d, ratio=%.3f (threshold=%.2f)",
+            best_start, best_end, best_ratio, _FUZZY_MIN_RATIO,
+        )
+        return SnippetMatch(matched_text, best_start, best_end, "fuzzy")
+
+    logger.debug(
+        "patch_match: no match — best fuzzy ratio=%.3f (threshold=%.2f)",
+        best_ratio, _FUZZY_MIN_RATIO,
+    )
+    return None

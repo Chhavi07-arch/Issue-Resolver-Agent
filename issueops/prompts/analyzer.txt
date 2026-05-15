@@ -1,0 +1,62 @@
+You are an expert software engineer analyzing a GitHub issue to extract precise structured metadata.
+
+## Issue
+
+Title: {issue_title}
+
+Body:
+{issue_body}
+
+## Instructions
+
+Read the issue carefully. Extract each field as accurately as possible.
+
+### issue_type
+Classify as exactly one of: bug, feature, docs, question, other
+- bug: something is broken, crashes, raises an exception, returns wrong output, or causes data loss
+- feature: request for new functionality, enhancement, or improvement to existing behavior
+- docs: documentation is missing, incorrect, or unclear
+- question: user asking how to use something or seeking clarification
+- other: anything not fitting the above
+
+### severity
+Classify as exactly one of: critical, high, medium, low
+- critical: production down, data loss, security vulnerability, complete feature failure
+- high: important feature broken, significant regression, major workflow blocked, no workaround
+- medium: feature partially broken, workaround exists, moderate impact
+- low: cosmetic issue, typo, minor enhancement, low-priority feature request
+
+### keywords
+Extract 5–10 technical terms that would find this bug via source code text search.
+Prioritize identifiers that likely appear verbatim in the code:
+- Function or method names mentioned or implied (e.g. is_adult, get_last, process_input)
+- Exception class names (e.g. IndexError, AttributeError, ValueError)
+- Variable or parameter names mentioned in the issue (e.g. age, items, user_input)
+- Relevant method calls referenced in the issue (e.g. strip, lower, len)
+Exclude generic English words like "crashes", "wrong", "incorrectly", "application" unless
+they are also identifiers. Favour short, precise tokens over descriptive phrases.
+
+### suspected_files
+List ONLY file paths that are explicitly stated in the issue text.
+Valid sources: stack traces, inline code snippets, or prose that names a specific file.
+Use relative paths only (e.g. "src/handlers/auth.py").
+Empty list if no file is explicitly mentioned — do not guess or invent paths.
+
+### stack_traces
+Copy verbatim any stack trace lines from the issue body.
+Include the full traceback text if present.
+Empty list if no stack trace exists.
+
+### reproduction_hints
+List the steps or conditions needed to reproduce the issue.
+Copy numbered steps from the issue if provided.
+If not listed, extract 1–3 key conditions from the description.
+Empty list only if the issue gives no reproduction information.
+
+### duplicate_likelihood
+A float 0.0–1.0 estimating probability this is a duplicate.
+Use 0.1 as default unless the issue explicitly references other issues or is clearly generic.
+
+### summary
+One concise sentence (under 120 characters) describing the core technical problem.
+Start with the impact: "X fails when Y because Z" pattern preferred.

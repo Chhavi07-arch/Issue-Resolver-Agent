@@ -1,0 +1,37 @@
+{
+  "action": "opened",
+  "issue": {
+    "url": "https://api.github.com/repos/demo-org/demo-repo/issues/42",
+    "html_url": "https://github.com/demo-org/demo-repo/issues/42",
+    "id": 1234567890,
+    "number": 42,
+    "title": "App crashes with AttributeError when processing empty user input",
+    "user": {
+      "login": "test-judge",
+      "id": 1
+    },
+    "state": "open",
+    "body": "## Bug Report\n\n### Description\nThe application crashes with an `AttributeError` when a user submits an empty form field.\n\n### Traceback\n```\nTraceback (most recent call last):\n  File \"src/handlers/user_input.py\", line 34, in process_input\n    result = input_data.strip().lower()\nAttributeError: 'NoneType' object has no attribute 'strip'\n```\n\n### Steps to Reproduce\n1. Navigate to the input form\n2. Leave the text field blank\n3. Click Submit\n4. Error appears in logs\n\n### Expected Behavior\nGraceful handling of empty input with a user-friendly validation message.\n\n### Actual Behavior\nUnhandled `AttributeError` propagates and returns a 500 response.\n\n### Environment\n- Python 3.11\n- FastAPI 0.111.0\n- Deployed on: local dev",
+    "labels": [
+      {"name": "bug"},
+      {"name": "priority:high"}
+    ],
+    "created_at": "2026-05-15T09:00:00Z",
+    "updated_at": "2026-05-15T09:00:00Z"
+  },
+  "repository": {
+    "id": 987654321,
+    "name": "demo-repo",
+    "full_name": "demo-org/demo-repo",
+    "owner": {
+      "login": "demo-org",
+      "id": 2
+    },
+    "default_branch": "main",
+    "html_url": "https://github.com/demo-org/demo-repo"
+  },
+  "sender": {
+    "login": "test-judge",
+    "id": 1
+  }
+}

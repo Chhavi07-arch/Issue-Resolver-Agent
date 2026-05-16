@@ -401,6 +401,37 @@ async def create_branch(
     return data  # type: ignore[return-value]
 
 
+async def branch_exists(owner: str, repo: str, branch: str) -> bool:
+    """Return True if the branch exists on the remote."""
+    sha = await _get_branch_sha(owner, repo, branch)
+    return sha is not None
+
+
+async def find_available_branch_name(
+    owner: str,
+    repo: str,
+    base_name: str,
+    max_attempts: int = 20,
+) -> str:
+    """Return base_name if the branch doesn't exist, otherwise try base_name-v2, -v3, ...
+
+    Falls back to base_name-v{timestamp} if all versioned names are taken.
+    """
+    import time
+
+    if not await branch_exists(owner, repo, base_name):
+        return base_name
+
+    for n in range(2, max_attempts + 1):
+        candidate = f"{base_name}-v{n}"
+        if not await branch_exists(owner, repo, candidate):
+            return candidate
+
+    # All versioned names taken — use a timestamp suffix as last resort
+    ts = int(time.time())
+    return f"{base_name}-v{ts}"
+
+
 async def create_or_update_file(
     owner: str,
     repo: str,

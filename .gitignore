@@ -79,3 +79,4 @@ logs/
 *.tmp
 *.bak
 .cache/
+PRODUCT.md

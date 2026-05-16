@@ -92,3 +92,29 @@ Maximum 5 files. Empty list if you cannot identify them.
 ### reasoning
 Write 2–4 sentences tracing your chain of evidence:
 what in the issue + file contents + commits led you to this conclusion.
+
+### suspected_symbols
+List identifiers (function names, class names, method names, field names) that
+appear in the root cause analysis. Rules:
+- Copy verbatim from the file contents shown above — do NOT invent names.
+- Maximum 8 symbols.
+- Empty list if you cannot identify specific identifiers.
+Examples: ["getUserById", "UserService", "taskOwnerId", "createdDate"]
+
+### repair_strategy
+One sentence: what specific change to make, naming the exact symbol and what to change about it.
+Must reference real identifiers from the code — not generic advice.
+Examples:
+  "In TaskService.getTasks(), change @Cacheable key from '#status' to '#userId + \"-\" + #status'"
+  "In UserController.getUser(), replace 'id == requestedId' with 'Objects.equals(id, requestedId)'"
+  "In Task entity, rename field 'createdDate' to 'createdAt' to match the repository sort parameter"
+Leave empty ("") if the fix requires runtime state or info not present in the file contents.
+
+### diagnosis_confidence
+Float 0.0–1.0 for how certain you are about the ROOT CAUSE location (independent of whether
+you can generate a patch). Use this scale:
+- 0.9+  exact symbol and line identified in file contents
+- 0.75  symbol identified, location likely
+- 0.60  class/subsystem identified, exact symbol uncertain
+- 0.45  subsystem identified, class uncertain
+- <0.45 insufficient evidence

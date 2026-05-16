@@ -14,11 +14,15 @@ from pathlib import Path
 from typing import Any
 
 from issueops.config.settings import settings
-from issueops.schemas.fix import FileEdit, FixResult
+from issueops.schemas.fix import FileEdit, FixResult, LinePatchResult, LineAnchoredEdit
 from issueops.tools import github as gh
-from issueops.tools.patch_builder import apply_edit_to_content, apply_and_diff
+from issueops.tools.bug_detectors import detect_in_file
+from issueops.tools.patch_builder import apply_edit_to_content, apply_and_diff, line_anchored_to_file_edit
 from issueops.tools.patch_validator import diff_size_ok, validate_fix_result
 from issueops.tools.patch_syntax import check_brace_balance, validate_replacement_syntax
+from issueops.tools.patch_verifier import verify_patch
+from issueops.tools.omium_tracing import checkpoint, trace
+from issueops.tools.symbol_search import extract_context_around_line, find_definition_line
 from issueops.workflows.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -31,32 +35,77 @@ _FILE_CONTENT_LIMIT = 3000   # chars per file in the fix prompt
 # Evidence formatter
 # ---------------------------------------------------------------------------
 
-def _format_file_contents(repo_context: dict[str, Any]) -> str:
+def _format_file_contents(
+    repo_context: dict[str, Any],
+    suspected_symbols: list[str] | None = None,
+) -> str:
+    """Format file contents for the fix prompt with line-number anchors.
+
+    When suspected_symbols are provided, attempts to locate the most relevant
+    function/method and shows that section (with accurate file-relative line
+    numbers) rather than always truncating from line 1.  This gives the LLM
+    the exact lines to edit even when the relevant code is deep in the file.
+    """
     snippets = repo_context.get("file_snippets") or {}
     if not snippets:
         return "(no file contents available — cannot generate grounded fix)"
 
     parts: list[str] = []
     for path, content in list(snippets.items())[:2]:
+        total_lines = len(content.splitlines())
+        shown_section: str | None = None
+        sec_start = 1
+
+        # Symbol-targeted extraction: find the relevant function, not just lines 1-N
+        if suspected_symbols:
+            for sym in suspected_symbols[:6]:
+                def_line = find_definition_line(sym, content)
+                if def_line is None:
+                    continue
+                section_text, sec_start, sec_end = extract_context_around_line(
+                    content, def_line, max_lines=40
+                )
+                if section_text.strip():
+                    header = (
+                        f"[lines {sec_start}–{sec_end} of {total_lines} "
+                        f"— context for symbol '{sym}']"
+                    )
+                    numbered_lines = [
+                        f"{sec_start + i:4d} | {line}"
+                        for i, line in enumerate(section_text.splitlines())
+                    ]
+                    numbered = "\n".join(numbered_lines)
+                    parts.append(f"### {path}\n{header}\n```\n{numbered}\n```")
+                    shown_section = sym
+                    break
+
+        if shown_section is not None:
+            # Telemetry: symbol resolved to a definition line
+            for sym in suspected_symbols[:6]:
+                def_line = find_definition_line(sym, content)
+                if def_line is not None:
+                    _, s_start, s_end = extract_context_around_line(content, def_line, max_lines=40)
+                    logger.info(
+                        "[SYMBOL_RESOLVE] symbol=%s line=%d file=%s context_lines=%d-%d",
+                        sym, def_line, path, s_start, s_end,
+                    )
+                    break
+            continue
+
+        # Default: first _FILE_CONTENT_LIMIT chars, with accurate line numbers
         truncated = content[:_FILE_CONTENT_LIMIT]
         is_truncated = len(content) > _FILE_CONTENT_LIMIT
-
-        # Line numbers give the LLM a concrete localization anchor — the model
-        # must cite source_lines (e.g. "23-27") before copying find_snippet,
-        # which prevents reconstruction from memory.
-        # The "NNN | " prefix is explicitly excluded from find_snippet/replace_with.
         numbered_lines = [
             f"{i:4d} | {line}"
             for i, line in enumerate(truncated.splitlines(), start=1)
         ]
         numbered = "\n".join(numbered_lines)
-
         footer = (
-            f"\n... [file truncated — shown lines 1-{len(numbered_lines)} only; "
+            f"\n... [file truncated — shown lines 1-{len(numbered_lines)} of {total_lines}; "
             "fix must target lines shown above]"
         ) if is_truncated else ""
-
         parts.append(f"### {path}\n```\n{numbered}{footer}\n```")
+
     return "\n\n".join(parts)
 
 
@@ -64,12 +113,25 @@ def _format_file_contents(repo_context: dict[str, Any]) -> str:
 # LLM path
 # ---------------------------------------------------------------------------
 
-async def _generate_fix_with_llm(state: WorkflowState) -> FixResult:
+async def _generate_fix_with_llm(
+    state: WorkflowState,
+    repo_context: dict[str, Any] | None = None,
+) -> FixResult:
     from issueops.tools.llm import generate_structured
 
     debug_result = state.get("debug_result") or {}
-    repo_context = state.get("repo_context") or {}
-    file_contents_text = _format_file_contents(repo_context)
+    if repo_context is None:
+        repo_context = state.get("repo_context") or {}
+
+    suspected_symbols = debug_result.get("suspected_symbols") or []
+    file_contents_text = _format_file_contents(repo_context, suspected_symbols)
+
+    # Prefer the more specific repair_strategy over suggested_fix_approach
+    fix_approach = (
+        debug_result.get("repair_strategy")
+        or debug_result.get("suggested_fix_approach")
+        or "unknown"
+    )
 
     template = _PROMPT_PATH.read_text()
     prompt = (
@@ -77,11 +139,183 @@ async def _generate_fix_with_llm(state: WorkflowState) -> FixResult:
         .replace("{issue_title}", state["issue_title"])
         .replace("{issue_body}", state["issue_body"] or "(no body)")
         .replace("{root_cause}", debug_result.get("root_cause", "unknown"))
-        .replace("{suggested_fix_approach}", debug_result.get("suggested_fix_approach", "unknown"))
+        .replace("{suggested_fix_approach}", fix_approach)
         .replace("{file_contents}", file_contents_text)
     )
 
     return await generate_structured(prompt, FixResult)
+
+
+# ---------------------------------------------------------------------------
+# Mode B: line-anchored patching
+# ---------------------------------------------------------------------------
+
+_ANCHORED_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "fix_pr_anchored.txt"
+_SURGICAL_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "fix_pr_surgical.txt"
+
+
+async def _generate_fix_mode_b(
+    state: WorkflowState,
+    repo_context: dict[str, Any],
+) -> tuple[FixResult, dict[str, str]]:
+    """Mode B: line-anchored patching. LLM cites line numbers; system extracts find_snippet."""
+    from issueops.tools.llm import generate_structured
+
+    debug_result = state.get("debug_result") or {}
+    suspected_symbols = debug_result.get("suspected_symbols") or []
+    file_contents_text = _format_file_contents(repo_context, suspected_symbols)
+    fix_approach = (
+        debug_result.get("repair_strategy")
+        or debug_result.get("suggested_fix_approach")
+        or "unknown"
+    )
+
+    template = _ANCHORED_PROMPT_PATH.read_text()
+    prompt = (
+        template
+        .replace("{issue_title}", state["issue_title"])
+        .replace("{issue_body}", state["issue_body"] or "(no body)")
+        .replace("{root_cause}", debug_result.get("root_cause", "unknown"))
+        .replace("{suggested_fix_approach}", fix_approach)
+        .replace("{file_contents}", file_contents_text)
+    )
+
+    line_result: LinePatchResult = await generate_structured(prompt, LinePatchResult)
+    logger.info(
+        "[PATCH_MODE] mode=B edits=%d confidence=%.2f",
+        len(line_result.edits), line_result.confidence,
+    )
+
+    # Convert line-anchored edits to FileEdits using actual file content
+    file_snippets = repo_context.get("file_snippets") or {}
+    file_edits = []
+    for anchored in line_result.edits:
+        content = file_snippets.get(anchored.path)
+        if content is None:
+            logger.warning(
+                "[PATCH_MODE] mode=B file=%s: content not in snippets", anchored.path
+            )
+            continue
+        fe = line_anchored_to_file_edit(anchored, content)
+        if fe is None:
+            logger.warning(
+                "[PATCH_MODE] mode=B file=%s: line range %d-%d out of bounds",
+                anchored.path, anchored.start_line, anchored.end_line,
+            )
+            continue
+        file_edits.append(fe)
+
+    if not file_edits:
+        logger.warning("[PATCH_EMPTY_RESPONSE] mode=B: no valid line-anchored edits after conversion")
+        return _fix_fallback(state, "Mode B: no valid line ranges")
+
+    # Build a FixResult from the line-anchored edits
+    fix = FixResult(
+        patch_plan=line_result.patch_plan,
+        files_to_modify=[e.path for e in file_edits],
+        proposed_edits=file_edits,
+        confidence=line_result.confidence,
+        validation_notes=line_result.validation_notes,
+        ready_for_pr=False,
+    )
+    return _run_validation(fix, repo_context)
+
+
+# ---------------------------------------------------------------------------
+# Mode C: surgical patch — single target file, forced edit output
+# ---------------------------------------------------------------------------
+
+async def _generate_fix_mode_c(
+    state: WorkflowState,
+    repo_context: dict[str, Any],
+) -> tuple["FixResult", dict[str, str]]:
+    """Mode C: surgical patch targeting one file. LLM is required to produce at least one edit."""
+    from issueops.tools.llm import generate_structured
+
+    debug_result = state.get("debug_result") or {}
+    file_snippets = repo_context.get("file_snippets") or {}
+
+    # Primary target: prefer debug-identified files that are present in snippets
+    relevant_files: list[str] = debug_result.get("relevant_files") or []
+    target_file = next((f for f in relevant_files if f in file_snippets), None)
+    if target_file is None:
+        target_file = next(iter(file_snippets), None)
+
+    if not target_file:
+        logger.warning("[PATCH_MODE_C] no target file available in snippets")
+        return _fix_fallback(state, "Mode C: no target file available")
+
+    content = file_snippets[target_file]
+    total_lines = len(content.splitlines())
+    numbered_lines = [
+        f"{i:4d} | {line}"
+        for i, line in enumerate(content.splitlines(), start=1)
+    ]
+    file_contents_text = f"### {target_file}\n```\n" + "\n".join(numbered_lines) + "\n```"
+
+    diagnosis_confidence = debug_result.get("diagnosis_confidence", 0.0)
+    fix_approach = (
+        debug_result.get("repair_strategy")
+        or debug_result.get("suggested_fix_approach")
+        or "unknown"
+    )
+
+    template = _SURGICAL_PROMPT_PATH.read_text()
+    prompt = (
+        template
+        .replace("{issue_title}", state["issue_title"])
+        .replace("{issue_body}", state["issue_body"] or "(no body)")
+        .replace("{root_cause}", debug_result.get("root_cause", "unknown"))
+        .replace("{suggested_fix_approach}", fix_approach)
+        .replace("{target_file}", target_file)
+        .replace("{file_contents}", file_contents_text)
+        .replace("{diagnosis_confidence}", f"{diagnosis_confidence:.0%}")
+    )
+
+    line_result: LinePatchResult = await generate_structured(prompt, LinePatchResult)
+    logger.info(
+        "[PATCH_MODE_C] target=%s edits=%d confidence=%.2f",
+        target_file, len(line_result.edits), line_result.confidence,
+    )
+
+    if not line_result.edits:
+        logger.warning(
+            "[PATCH_EMPTY_RESPONSE] mode=C target=%s LLM returned empty edits despite surgical constraint",
+            target_file,
+        )
+        return _fix_fallback(state, "Mode C: LLM returned no edits despite surgical constraint")
+
+    # Convert line-anchored edits to FileEdits — normalise path to target_file
+    file_edits = []
+    for anchored in line_result.edits:
+        if anchored.path != target_file:
+            logger.warning(
+                "[PATCH_MODE_C] LLM cited path=%s but target is %s — normalizing",
+                anchored.path, target_file,
+            )
+            anchored = anchored.model_copy(update={"path": target_file})
+        fe = line_anchored_to_file_edit(anchored, content)
+        if fe is None:
+            logger.warning(
+                "[PATCH_MODE_C] file=%s: line range %d-%d out of bounds (file has %d lines)",
+                target_file, anchored.start_line, anchored.end_line, total_lines,
+            )
+            continue
+        file_edits.append(fe)
+
+    if not file_edits:
+        logger.warning("[PATCH_MODE_C] no valid edits after line range conversion for %s", target_file)
+        return _fix_fallback(state, "Mode C: line ranges out of bounds")
+
+    fix = FixResult(
+        patch_plan=line_result.patch_plan,
+        files_to_modify=[e.path for e in file_edits],
+        proposed_edits=file_edits,
+        confidence=line_result.confidence,
+        validation_notes=line_result.validation_notes,
+        ready_for_pr=False,
+    )
+    return _run_validation(fix, repo_context)
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +332,12 @@ def _run_validation(
     validation_issues: list[str] = []
 
     all_valid, notes = validate_fix_result(fix_result, file_snippets)
+    logger.info(
+        "[PATCH_VALIDATION] result=%s files=%d notes='%s'",
+        "pass" if all_valid else "fail",
+        len(fix_result.proposed_edits),
+        notes[:120],
+    )
 
     if all_valid:
         for edit in fix_result.proposed_edits:
@@ -141,6 +381,10 @@ def _run_validation(
 
             diffs[edit.path] = diff
             logger.info("patch_builder: diff built for %s (%s)", edit.path, size_note)
+            logger.info(
+                "[PATCH_VALIDATION] result=pass method=diff_build file=%s size=%s",
+                edit.path, size_note,
+            )
 
     final_notes = notes
     if validation_issues:
@@ -152,6 +396,68 @@ def _run_validation(
     })
 
     return updated, diffs
+
+
+# ---------------------------------------------------------------------------
+# Stage A: Deterministic detector-based fix
+# ---------------------------------------------------------------------------
+
+def _try_detector_fix(
+    state: WorkflowState,
+    repo_context: dict[str, Any],
+) -> tuple["FixResult | None", dict[str, str]]:
+    """Try pattern-based bug detectors before invoking the LLM.
+
+    Returns (FixResult, diffs) if a detector fires with sufficient confidence,
+    (None, {}) otherwise.  Detectors are synchronous and require no LLM call.
+    """
+    debug_result = state.get("debug_result") or {}
+    root_cause: str = debug_result.get("root_cause", "")
+    suspected_symbols: list[str] = debug_result.get("suspected_symbols") or []
+    repair_strategy: str = debug_result.get("repair_strategy") or ""
+    file_snippets: dict[str, str] = repo_context.get("file_snippets") or {}
+
+    for path, content in file_snippets.items():
+        det = detect_in_file(path, content, root_cause, suspected_symbols, repair_strategy)
+        if det is None:
+            continue
+
+        logger.info(
+            "[DETECTOR_HIT] pattern=%s file=%s confidence=%.2f",
+            det.pattern_name, path, det.confidence,
+        )
+
+        edit = FileEdit(
+            path=path,
+            change_summary=det.description,
+            source_lines="detector",
+            find_snippet=det.find_snippet,
+            replace_with=det.replace_with,
+        )
+
+        diff, applied = apply_and_diff(content, edit)
+        if not applied or diff is None:
+            logger.warning(
+                "FixPR detector: match for %s but apply_and_diff failed — skipping",
+                path,
+            )
+            continue
+
+        fix_result = FixResult(
+            patch_plan=f"Deterministic fix ({det.pattern_name}): {det.description}",
+            files_to_modify=[path],
+            proposed_edits=[edit],
+            confidence=det.confidence,
+            validation_notes=f"Applied via deterministic detector '{det.pattern_name}'",
+            ready_for_pr=True,
+        )
+        logger.info(
+            "FixPR detector: '%s' generated a validated fix for %s (confidence=%.2f)",
+            det.pattern_name, path, det.confidence,
+        )
+        return fix_result, {path: diff}
+
+    return None, {}
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +520,151 @@ def _fix_fallback(state: WorkflowState, reason: str) -> tuple[FixResult, dict[st
         ready_for_pr=False,
     )
     return result, {}
+
+
+# ---------------------------------------------------------------------------
+# Diagnosis-only PR helpers
+# ---------------------------------------------------------------------------
+
+def _build_diagnosis_only_content(
+    issue_id: int | str,
+    debug_result: dict[str, Any],
+    state: WorkflowState,
+) -> str:
+    """Generate the markdown diagnosis file committed to the diagnosis-only PR branch."""
+    root_cause = debug_result.get("root_cause", "See issue")
+    repair_strategy = debug_result.get("repair_strategy", "")
+    suspected_symbols = debug_result.get("suspected_symbols") or []
+    relevant_files = debug_result.get("relevant_files") or []
+    diagnosis_confidence = debug_result.get("diagnosis_confidence", 0.0)
+
+    lines = [
+        f"# IssueOps Diagnosis — Issue #{issue_id}",
+        "",
+        f"**Issue:** {state['issue_title']}",
+        "",
+        f"**Root Cause** (confidence: {diagnosis_confidence:.0%}):",
+        root_cause,
+        "",
+    ]
+    if repair_strategy:
+        lines += [f"**Suggested Fix:**", repair_strategy, ""]
+    if suspected_symbols:
+        lines.append(f"**Relevant Symbols:** `{'`, `'.join(suspected_symbols[:6])}`")
+        lines.append("")
+    if relevant_files:
+        lines.append("**Files to Investigate:**")
+        lines += [f"- `{f}`" for f in relevant_files[:4]]
+        lines.append("")
+    lines += [
+        "---",
+        "*This PR was created automatically by IssueOps.*",
+        "*No production code was modified — this is a diagnosis-only draft for human review.*",
+    ]
+    return "\n".join(lines)
+
+
+def _build_diagnosis_pr_metadata(
+    state: WorkflowState,
+    debug_result: dict[str, Any],
+) -> dict[str, str]:
+    issue_id = state["issue_id"]
+    root_cause = debug_result.get("root_cause", "See analysis")
+    repair_strategy = debug_result.get("repair_strategy", "")
+    diagnosis_confidence = debug_result.get("diagnosis_confidence", 0.0)
+
+    pr_body = (
+        f"## IssueOps Diagnosis PR — Issue #{issue_id}\n\n"
+        f"Automated patch generation failed, but root cause was identified "
+        f"with **{diagnosis_confidence:.0%} confidence**.\n\n"
+        f"### Root Cause\n{root_cause}\n\n"
+    )
+    if repair_strategy:
+        pr_body += f"### Suggested Human Fix\n{repair_strategy}\n\n"
+    pr_body += (
+        "> **Diagnosis-Only Draft PR** — no production code was modified automatically.\n"
+        "> A human engineer should implement the suggested fix and push to this branch."
+    )
+
+    return {
+        "branch": f"issueops/fix-issue-{issue_id}",
+        "pr_title": f"diagnosis: issue #{issue_id} — {state['issue_title'][:50]}",
+        "pr_body": pr_body,
+        "commit_message": f"docs: IssueOps diagnosis notes for issue #{issue_id}",
+        "diagnosis_file": f".issueops/diagnosis-issue-{issue_id}.md",
+    }
+
+
+async def _execute_diagnosis_only_pr(
+    state: WorkflowState,
+    debug_result: dict[str, Any],
+    pr_meta: dict[str, str],
+) -> dict[str, Any]:
+    """Create branch + diagnosis notes file + draft PR + issue comment."""
+    owner = state["repo_owner"]
+    repo = state["repo_name"]
+    issue_id = state["issue_id"]
+    branch_name = pr_meta["branch"]
+    existing_errors = list(state.get("errors") or [])
+
+    diagnosis_content = _build_diagnosis_only_content(issue_id, debug_result, state)
+
+    try:
+        base_branch = await gh.get_default_branch(owner, repo)
+        await gh.create_branch(owner, repo, base_branch, branch_name)
+
+        await gh.create_or_update_file(
+            owner, repo, pr_meta["diagnosis_file"], diagnosis_content,
+            branch_name, pr_meta["commit_message"],
+        )
+
+        pr_data = await gh.create_draft_pr(
+            owner, repo,
+            pr_meta["pr_title"], pr_meta["pr_body"],
+            branch_name, base_branch,
+        )
+        pr_url: str = pr_data.get("html_url", "")
+        pr_number: int = pr_data.get("number", 0)
+
+        diagnosis_confidence = debug_result.get("diagnosis_confidence", 0.0)
+        comment_body = (
+            f"## IssueOps — Diagnosis PR Opened\n\n"
+            f"Automated patch generation failed, but root cause was identified "
+            f"({diagnosis_confidence:.0%} confidence).\n\n"
+            f"A diagnosis-only draft PR has been opened for human review: {pr_url}\n\n"
+            f"**Root Cause:** {debug_result.get('root_cause', 'See PR')[:300]}\n\n"
+            f"> No code was modified automatically. Human implementation required."
+        )
+        comment_data = await gh.comment_on_issue(owner, repo, issue_id, comment_body)
+        comment_url: str = comment_data.get("html_url", "")
+
+        logger.info("[DIAGNOSIS_ONLY_PR] created PR #%d %s", pr_number, pr_url)
+        return {
+            "fix_result": {
+                "patch_plan": debug_result.get("repair_strategy", "Diagnosis only — no automated fix"),
+                "files_to_modify": [],
+                "proposed_edits": [],
+                "confidence": 0.0,
+                "validation_notes": "Diagnosis-only PR — no code edits applied",
+                "ready_for_pr": False,
+                "diagnosis_only": True,
+                **pr_meta,
+                "mock_writes": False,
+            },
+            "pr_url": pr_url,
+            "issue_comment_url": comment_url,
+            "current_step": "completed",
+        }
+
+    except gh.GitHubWriteError as exc:
+        logger.error("[DIAGNOSIS_ONLY_PR] write failed: %s", exc)
+        return {
+            "fix_result": {"diagnosis_only": True, "write_error": str(exc), "mock_writes": False},
+            "pr_url": None,
+            "issue_comment_url": None,
+            "current_step": "write_failed",
+            "errors": existing_errors + [str(exc)],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -286,20 +737,33 @@ def _build_low_confidence_comment(
     issue_id: int,
     confidence: float,
     root_cause: str,
+    suspected_symbols: list[str] | None = None,
+    repair_strategy: str = "",
+    diagnosis_confidence: float = 0.0,
+    relevant_files: list[str] | None = None,
 ) -> str:
-    return (
+    body = (
         f"## IssueOps — Investigation Complete\n\n"
-        f"IssueOps investigated issue #{issue_id} but confidence was too low "
+        f"IssueOps investigated issue #{issue_id} but patch confidence was too low "
         f"({confidence:.0%}) to generate an automated fix.\n\n"
-        f"**Partial analysis:**\n{root_cause}\n\n"
-        f"A human engineer should review and address this issue."
+        f"**Root Cause Analysis** (diagnosis confidence: {diagnosis_confidence:.0%}):\n"
+        f"{root_cause}\n\n"
     )
+    if repair_strategy:
+        body += f"**Suggested Fix:**\n{repair_strategy}\n\n"
+    if suspected_symbols:
+        body += f"**Relevant symbols:** `{'`, `'.join(suspected_symbols[:6])}`\n\n"
+    if relevant_files:
+        body += "**Files to investigate:**\n" + "\n".join(f"- `{f}`" for f in relevant_files[:4]) + "\n\n"
+    body += "> Automated patch was not applied — human review required."
+    return body
 
 
 # ---------------------------------------------------------------------------
 # Live write pipeline
 # ---------------------------------------------------------------------------
 
+@trace("execute_writes")
 async def _execute_writes(
     state: WorkflowState,
     fix_result: FixResult,
@@ -343,6 +807,22 @@ async def _execute_writes(
                     f"Edit did not apply to full content of '{edit.path}' — "
                     "snippet may differ from current file"
                 )
+
+            # Post-apply verification
+            verification = await verify_patch(edit.path, new_content)
+            logger.info(
+                "[PATCH_VERIFICATION] result=%s method=%s file=%s detail=%s",
+                "pass" if verification.passed else "fail",
+                verification.method, edit.path, verification.detail[:100],
+            )
+            if not verification.passed:
+                logger.warning(
+                    "[PATCH_VERIFICATION] verification failed but proceeding — human review required"
+                )
+                # Apply confidence_multiplier to fix_result.confidence
+                fix_result = fix_result.model_copy(update={
+                    "confidence": fix_result.confidence * verification.confidence_multiplier,
+                })
 
             await gh.create_or_update_file(
                 owner, repo, edit.path, new_content,
@@ -410,6 +890,7 @@ async def _execute_writes(
 # Agent entry points
 # ---------------------------------------------------------------------------
 
+@trace("generate_fix_and_pr")
 async def generate_fix_and_pr(state: WorkflowState) -> dict[str, Any]:
     """Generate real code fix, validate, and (optionally) execute GitHub writes.
 
@@ -427,42 +908,114 @@ async def generate_fix_and_pr(state: WorkflowState) -> dict[str, Any]:
         issue_id, owner, repo, dry_run,
     )
 
+    await checkpoint("before_fix_generation")
     use_llm = settings.llm_available and not state.get("disable_llm", False)
     repo_context = state.get("repo_context") or {}
-    llm_succeeded = False
-    raw_fix: FixResult
     diffs_final: dict[str, str] = {}
 
-    # --- 0. Enrich repo_context with any files the debug agent identified but
-    #        repo_context didn't retrieve (e.g. auth files fetched instead of domain files) ---
-    if use_llm:
-        repo_context = await _enrich_snippets_with_debug_files(state, repo_context)
+    # --- 0. Enrich repo_context with debug-identified files missing from retrieval ---
+    repo_context = await _enrich_snippets_with_debug_files(state, repo_context)
 
-    # --- 1. Generate fix ---
-    if use_llm:
-        try:
-            raw_fix = await _generate_fix_with_llm(state)
-            llm_succeeded = True
+    # --- 1a. Stage A: Deterministic detectors (no LLM, zero hallucination risk) ---
+    fix_result, diffs_final = _try_detector_fix(state, repo_context)
+
+    if fix_result is not None:
+        logger.info(
+            "FixPR: detector stage succeeded — skipping LLM (confidence=%.2f)",
+            fix_result.confidence,
+        )
+    else:
+        # --- 1b. Stage B: LLM-generated fix with symbol-targeted context ---
+        llm_succeeded = False
+        raw_fix: FixResult
+
+        if use_llm:
+            try:
+                raw_fix = await _generate_fix_with_llm(state, repo_context)
+                llm_succeeded = True
+                logger.info(
+                    "FixPR: LLM generated fix — files=%s confidence=%.2f",
+                    raw_fix.files_to_modify, raw_fix.confidence,
+                )
+            except Exception as exc:
+                exc_name = type(exc).__name__
+                if "ValidationError" in exc_name or "validation_error" in exc_name.lower():
+                    logger.warning("[PATCH_SCHEMA_FAIL] mode=A schema validation failed: %s", exc)
+                else:
+                    logger.warning("FixPR: LLM failed (%s: %s), using fallback", exc_name, exc)
+                raw_fix, diffs_final = _fix_fallback(state, f"LLM error: {exc_name}")
+        else:
+            reason = "no API key" if not settings.llm_available else "disabled via flag"
+            logger.info("FixPR: skipping LLM (%s)", reason)
+            raw_fix, diffs_final = _fix_fallback(state, f"LLM unavailable: {reason}")
+
+        # --- 2. Validate + build diffs (only when LLM produced a result) ---
+        if llm_succeeded:
+            if not raw_fix.proposed_edits:
+                logger.warning(
+                    "[PATCH_EMPTY_RESPONSE] mode=A LLM returned empty edits — confidence=%.2f",
+                    raw_fix.confidence,
+                )
+            fix_result, diffs_final = _run_validation(raw_fix, repo_context)
             logger.info(
-                "FixPR: LLM generated fix — files=%s confidence=%.2f",
-                raw_fix.files_to_modify, raw_fix.confidence,
+                "[PATCH_MODE] mode=A result=%s confidence=%.2f",
+                "ready" if fix_result.ready_for_pr else "not_ready",
+                fix_result.confidence,
             )
-        except Exception as exc:
-            logger.warning(
-                "FixPR: LLM failed (%s: %s), using fallback",
-                type(exc).__name__, exc,
-            )
-            raw_fix, diffs_final = _fix_fallback(state, f"LLM error: {type(exc).__name__}")
-    else:
-        reason = "no API key" if not settings.llm_available else "disabled via flag"
-        logger.info("FixPR: skipping LLM (%s)", reason)
-        raw_fix, diffs_final = _fix_fallback(state, f"LLM unavailable: {reason}")
+        else:
+            fix_result = raw_fix
 
-    # --- 2. Validate + build diffs (only when LLM produced a result) ---
-    if llm_succeeded:
-        fix_result, diffs_final = _run_validation(raw_fix, repo_context)
-    else:
-        fix_result = raw_fix
+        # --- 1c. Stage B fallback: line-anchored patching ---
+        if not fix_result.ready_for_pr and use_llm:
+            logger.info("[PATCH_MODE] mode=A failed, trying mode=B (line-anchored)")
+            try:
+                fix_result, diffs_final = await _generate_fix_mode_b(state, repo_context)
+                logger.info(
+                    "[PATCH_MODE] mode=B result=%s confidence=%.2f",
+                    "ready" if fix_result.ready_for_pr else "not_ready",
+                    fix_result.confidence,
+                )
+            except Exception as exc:
+                exc_name = type(exc).__name__
+                if "ValidationError" in exc_name or "validation_error" in exc_name.lower():
+                    logger.warning("[PATCH_SCHEMA_FAIL] mode=B schema validation failed: %s", exc)
+                else:
+                    logger.warning(
+                        "[PATCH_MODE] mode=B failed (%s: %s), keeping mode=A result",
+                        exc_name, exc,
+                    )
+
+        # --- 1d. Stage C: surgical patch — forced edit, single target file ---
+        if not fix_result.ready_for_pr and use_llm:
+            _dbg = state.get("debug_result") or {}
+            _diag_conf = _dbg.get("diagnosis_confidence", 0.0)
+            if _diag_conf >= settings.confidence_threshold:
+                logger.info(
+                    "[PATCH_RETRY_REASON] modes A+B produced no edits but "
+                    "diagnosis_confidence=%.2f >= threshold=%.2f — attempting Mode C (surgical)",
+                    _diag_conf, settings.confidence_threshold,
+                )
+                try:
+                    fix_result, diffs_final = await _generate_fix_mode_c(state, repo_context)
+                    logger.info(
+                        "[PATCH_MODE_C] result=%s confidence=%.2f",
+                        "ready" if fix_result.ready_for_pr else "not_ready",
+                        fix_result.confidence,
+                    )
+                except Exception as exc:
+                    exc_name = type(exc).__name__
+                    if "ValidationError" in exc_name or "validation_error" in exc_name.lower():
+                        logger.warning("[PATCH_SCHEMA_FAIL] mode=C schema validation failed: %s", exc)
+                    else:
+                        logger.warning(
+                            "[PATCH_MODE_C] failed (%s: %s), keeping previous result",
+                            exc_name, exc,
+                        )
+            else:
+                logger.info(
+                    "[PATCH_RETRY_REASON] diagnosis_confidence=%.2f < threshold=%.2f — Mode C not attempted",
+                    _diag_conf, settings.confidence_threshold,
+                )
 
     logger.info(
         "FixPR: validation done — ready_for_pr=%s diffs=%d notes='%s'",
@@ -477,10 +1030,46 @@ async def generate_fix_and_pr(state: WorkflowState) -> dict[str, Any]:
     # --- 4. Safety gate: escalate if not ready ---
     if not fix_result.ready_for_pr:
         debug_result = state.get("debug_result") or {}
+        diagnosis_confidence = debug_result.get("diagnosis_confidence", 0.0)
+        logger.info(
+            "[PR_REASON] decision=escalate confidence=%.2f diagnosis_confidence=%.2f",
+            fix_result.confidence,
+            diagnosis_confidence,
+        )
+
+        # Diagnosis-only PR: open a PR with root cause notes when all patches failed
+        # but diagnosis confidence is high enough and feature flag is enabled.
+        if (
+            settings.allow_diagnosis_only_pr
+            and diagnosis_confidence >= 0.75
+            and fix_result.confidence == 0.0
+        ):
+            logger.info(
+                "[PR_REASON] diagnosis_only_pr=eligible diagnosis_confidence=%.2f — opening diagnosis PR",
+                diagnosis_confidence,
+            )
+            diag_meta = _build_diagnosis_pr_metadata(state, debug_result)
+            if not dry_run:
+                return await _execute_diagnosis_only_pr(state, debug_result, diag_meta)
+            pr_number = 1000 + (issue_id if isinstance(issue_id, int) else 0)
+            mock_pr_url = f"https://github.com/{owner}/{repo}/pull/{pr_number}"
+            mock_comment_url = f"https://github.com/{owner}/{repo}/issues/{issue_id}#issuecomment-dry-run"
+            logger.info("[DIAGNOSIS_ONLY_PR] dry run: would create diagnosis PR at %s", mock_pr_url)
+            return {
+                "fix_result": {"diagnosis_only": True, "mock_writes": True, **diag_meta},
+                "pr_url": mock_pr_url,
+                "issue_comment_url": mock_comment_url,
+                "current_step": "completed",
+            }
+
         low_conf_comment = _build_low_confidence_comment(
             issue_id,
             fix_result.confidence,
             debug_result.get("root_cause", "Analysis unavailable"),
+            suspected_symbols=debug_result.get("suspected_symbols"),
+            repair_strategy=debug_result.get("repair_strategy", ""),
+            diagnosis_confidence=debug_result.get("diagnosis_confidence", 0.0),
+            relevant_files=debug_result.get("relevant_files"),
         )
 
         if not dry_run:
@@ -506,6 +1095,11 @@ async def generate_fix_and_pr(state: WorkflowState) -> dict[str, Any]:
         }
 
     # --- 5. Execute writes or return dry-run result ---
+    logger.info(
+        "[PR_REASON] decision=create confidence=%.2f branch=%s",
+        fix_result.confidence, pr_meta["branch"],
+    )
+    await checkpoint("before_pr_creation")
     if not dry_run:
         return await _execute_writes(state, fix_result, diffs_final, pr_meta)
 
@@ -546,7 +1140,13 @@ async def escalate_to_comment(state: WorkflowState) -> dict[str, Any]:
     )
 
     comment_body = _build_low_confidence_comment(
-        issue_id, confidence, debug_result.get("root_cause", "unknown")
+        issue_id,
+        confidence,
+        debug_result.get("root_cause", "unknown"),
+        suspected_symbols=debug_result.get("suspected_symbols"),
+        repair_strategy=debug_result.get("repair_strategy", ""),
+        diagnosis_confidence=debug_result.get("diagnosis_confidence", 0.0),
+        relevant_files=debug_result.get("relevant_files"),
     )
 
     if not dry_run:

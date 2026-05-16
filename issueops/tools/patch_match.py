@@ -1,6 +1,6 @@
 """Whitespace-tolerant snippet matching for patch validation and application.
 
-Three progressive levels, each attempted before falling to the next:
+Four progressive levels, each attempted before falling to the next:
 
   Level 1 — exact, line-boundary:
       verbatim substring match, but only where the snippet starts at position 0
@@ -22,9 +22,15 @@ Three progressive levels, each attempted before falling to the next:
       Only attempted when the snippet has >= _FUZZY_MIN_LINES non-blank lines.
       Only accepted when ratio >= _FUZZY_MIN_RATIO.
 
+  Level 4 — short-snippet fuzzy:
+      For 1-2 line snippets that cannot use Level 3 (too short for multi-line
+      windowing), finds the single line or consecutive pair with the best
+      difflib ratio against the snippet.  Threshold _SHORT_FUZZY_MIN_RATIO.
+
 Safety invariants:
   - Levels 1 and 2 require structural equality — no approximation.
   - Level 3 uses a conservative ratio threshold plus a minimum-lines guard.
+  - Level 4 uses a separate (also conservative) threshold for short snippets.
   - All levels return the ORIGINAL (unnormalized) matched text so callers
     can do a literal str.replace() that never introduces normalization
     artifacts into the file.
@@ -44,11 +50,14 @@ logger = logging.getLogger(__name__)
 _FUZZY_MIN_RATIO: float = 0.85
 
 # Fuzzy match: only attempted when snippet has at least this many non-blank lines.
-# Small snippets have too little signal to distinguish false positives.
-_FUZZY_MIN_LINES: int = 3
+# Lowered from 3 to 2 so 2-line snippets can also use Level 3.
+_FUZZY_MIN_LINES: int = 2
 
 # Fuzzy match: try window sizes snippet_lines ± this slack to absorb blank-line variance.
 _FUZZY_SLACK: int = 2
+
+# Short-snippet fuzzy (Level 4): ratio threshold for 1-2 line snippets.
+_SHORT_FUZZY_MIN_RATIO: float = 0.82
 
 
 # ─── Result type ─────────────────────────────────────────────────────────────
@@ -78,7 +87,11 @@ def _norm(line: str) -> str:
 
 # ─── Public API ──────────────────────────────────────────────────────────────
 
-def find_snippet(snippet: str, content: str) -> Optional[SnippetMatch]:
+def find_snippet(
+    snippet: str,
+    content: str,
+    anchor_symbols: list[str] | None = None,
+) -> Optional[SnippetMatch]:
     """Find snippet in content with progressive whitespace tolerance.
 
     Returns a SnippetMatch whose .matched_text is the verbatim substring of
@@ -87,6 +100,13 @@ def find_snippet(snippet: str, content: str) -> Optional[SnippetMatch]:
 
     Use matched_text as the first argument to str.replace() so edits always
     target original text, never normalized text.
+
+    Args:
+        snippet: The code block to locate.
+        content: Full file content to search in.
+        anchor_symbols: Optional list of symbol names.  When provided, the
+            search first focuses on lines near those symbols (nearest-symbol
+            fallback) before falling through to full-file scanning.
     """
     if not snippet or not content:
         return None
@@ -100,14 +120,28 @@ def find_snippet(snippet: str, content: str) -> Optional[SnippetMatch]:
     match = _normalized_match(snippet, content)
     if match is not None:
         logger.info(
-            "patch_match: normalized match at lines %d-%d "
+            "[PATCH_MATCH] normalized match at lines %d-%d "
             "(exact match failed — whitespace difference)",
             match.start_line, match.end_line,
         )
         return match
 
+    # ── Nearest-symbol pre-scan (anchor_symbols) ─────────────────────────────
+    # When caller provides anchor symbols, try to find the snippet near those
+    # symbol definitions first.  This narrows the search window and increases
+    # confidence for short snippets that appear in multiple locations.
+    if anchor_symbols:
+        match = _anchor_symbol_match(snippet, content, anchor_symbols)
+        if match is not None:
+            return match
+
     # ── Level 3: fuzzy (character-level difflib) ──────────────────────────────
     match = _fuzzy_match(snippet, content)
+    if match is not None:
+        return match
+
+    # ── Level 4: short-snippet fuzzy (1-2 line snippets) ─────────────────────
+    match = _short_snippet_fuzzy_match(snippet, content)
     return match
 
 
@@ -224,13 +258,137 @@ def _fuzzy_match(snippet: str, content: str) -> Optional[SnippetMatch]:
     if best_ratio >= _FUZZY_MIN_RATIO and best_start >= 0:
         matched_text = "".join(content_lines_raw[best_start:best_end])
         logger.info(
-            "patch_match: fuzzy match at lines %d-%d, ratio=%.3f (threshold=%.2f)",
+            "[PATCH_MATCH] fuzzy match at lines %d-%d, ratio=%.3f (threshold=%.2f)",
             best_start, best_end, best_ratio, _FUZZY_MIN_RATIO,
         )
         return SnippetMatch(matched_text, best_start, best_end, "fuzzy")
 
     logger.debug(
-        "patch_match: no match — best fuzzy ratio=%.3f (threshold=%.2f)",
+        "[PATCH_MATCH] no Level-3 match — best fuzzy ratio=%.3f (threshold=%.2f)",
         best_ratio, _FUZZY_MIN_RATIO,
+    )
+    return None
+
+
+# ─── Nearest-symbol anchor pre-scan ──────────────────────────────────────────
+
+def _anchor_symbol_match(
+    snippet: str, content: str, anchor_symbols: list[str]
+) -> Optional[SnippetMatch]:
+    """Search near lines containing anchor symbols before full-file scan.
+
+    Tries exact and normalized matching restricted to a ±50-line window around
+    each anchor symbol occurrence.  Returns None if no match is found in any
+    window (caller falls through to full-file fuzzy).
+    """
+    content_lines_raw = content.splitlines(keepends=True)
+    content_lines = content.splitlines()
+
+    for sym in anchor_symbols:
+        if not sym:
+            continue
+        for i, line in enumerate(content_lines):
+            if sym not in line:
+                continue
+            # Narrow window around this symbol occurrence
+            win_start = max(0, i - 50)
+            win_end = min(len(content_lines), i + 50)
+            window_content = "".join(content_lines_raw[win_start:win_end])
+
+            # Try exact then normalized in the window
+            m = _exact_match(snippet, window_content)
+            if m is not None:
+                # Adjust line numbers to be file-relative
+                adj = SnippetMatch(
+                    m.matched_text,
+                    m.start_line + win_start,
+                    m.end_line + win_start,
+                    "anchor_exact",
+                )
+                logger.info(
+                    "[PATCH_MATCH] anchor_exact match near symbol '%s' at lines %d-%d",
+                    sym, adj.start_line, adj.end_line,
+                )
+                return adj
+
+            m = _normalized_match(snippet, window_content)
+            if m is not None:
+                adj = SnippetMatch(
+                    m.matched_text,
+                    m.start_line + win_start,
+                    m.end_line + win_start,
+                    "anchor_normalized",
+                )
+                logger.info(
+                    "[PATCH_MATCH] anchor_normalized match near symbol '%s' at lines %d-%d",
+                    sym, adj.start_line, adj.end_line,
+                )
+                return adj
+
+    return None
+
+
+# ─── Level 4: short-snippet fuzzy (1-2 non-blank lines) ──────────────────────
+
+def _short_snippet_fuzzy_match(snippet: str, content: str) -> Optional[SnippetMatch]:
+    """Level 4 fuzzy match for 1-2 line snippets.
+
+    Level 3 requires _FUZZY_MIN_LINES non-blank lines and uses multi-line
+    windows.  For 1-2 line snippets that still have no match after Levels 1-3,
+    this level:
+      - 1-line snippets: scans every line in content, picks best difflib ratio.
+      - 2-line snippets: scans every consecutive pair, picks best difflib ratio.
+
+    Threshold: _SHORT_FUZZY_MIN_RATIO (0.82 by default).
+    """
+    snip_nb = [_norm(l) for l in snippet.splitlines() if l.strip()]
+    n_lines = len(snip_nb)
+
+    if n_lines == 0 or n_lines > 2:
+        # Level 4 only handles 1-2 line snippets; longer handled by Level 3
+        return None
+
+    snip_joined = "\n".join(snip_nb)
+    content_lines_raw = content.splitlines(keepends=True)
+    content_norm = [_norm(l) for l in content.splitlines()]
+    total = len(content_norm)
+
+    best_ratio = 0.0
+    best_start = -1
+
+    if n_lines == 1:
+        for i, line in enumerate(content_norm):
+            if not line:
+                continue
+            ratio = difflib.SequenceMatcher(None, snip_joined, line).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_start = i
+        best_end = best_start + 1
+    else:  # n_lines == 2
+        for i in range(total - 1):
+            pair_nb = [l for l in content_norm[i : i + 2] if l]
+            if not pair_nb:
+                continue
+            pair_joined = "\n".join(pair_nb)
+            ratio = difflib.SequenceMatcher(None, snip_joined, pair_joined).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_start = i
+        best_end = best_start + 2
+
+    if best_ratio >= _SHORT_FUZZY_MIN_RATIO and best_start >= 0:
+        matched_text = "".join(content_lines_raw[best_start:best_end])
+        logger.info(
+            "[PATCH_MATCH] short_fuzzy match at lines %d-%d, ratio=%.3f "
+            "(threshold=%.2f, snippet_lines=%d)",
+            best_start, best_end, best_ratio, _SHORT_FUZZY_MIN_RATIO, n_lines,
+        )
+        return SnippetMatch(matched_text, best_start, best_end, "short_fuzzy")
+
+    logger.debug(
+        "[PATCH_MATCH] Level-4 short_fuzzy: no match — best ratio=%.3f "
+        "(threshold=%.2f, snippet_lines=%d)",
+        best_ratio, _SHORT_FUZZY_MIN_RATIO, n_lines,
     )
     return None

@@ -3,6 +3,7 @@
 import logging
 from typing import Any
 
+from issueops.tools.omium_tracing import trace
 from issueops.workflows.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -10,6 +11,7 @@ logger = logging.getLogger(__name__)
 _STR_FIELDS = ("repo_owner", "repo_name", "issue_title")
 
 
+@trace("plan")
 async def plan(state: WorkflowState) -> dict[str, Any]:
     """Validate required fields are present and log workflow start.
 

@@ -7,6 +7,7 @@ from typing import Any
 
 from issueops.config.settings import settings
 from issueops.schemas.debug import DebugResult
+from issueops.tools.omium_tracing import checkpoint, trace
 from issueops.workflows.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,7 @@ def _debug_heuristic(state: WorkflowState) -> DebugResult:
 # Agent entry point
 # ---------------------------------------------------------------------------
 
+@trace("debug_root_cause")
 async def debug_root_cause(state: WorkflowState) -> dict[str, Any]:
     """Root cause analysis.
 
@@ -200,4 +202,6 @@ async def debug_root_cause(state: WorkflowState) -> dict[str, Any]:
         source, result.confidence, result.escalate, len(result.relevant_files),
     )
 
-    return {"debug_result": result.model_dump(), "current_step": "debugged"}
+    outcome = {"debug_result": result.model_dump(), "current_step": "debugged"}
+    await checkpoint("after_debugging")
+    return outcome

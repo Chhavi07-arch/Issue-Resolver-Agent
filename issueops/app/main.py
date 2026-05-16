@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
 
 from issueops.config.settings import settings
+from issueops.tools.omium_tracing import create_run, init_omium
 from issueops.workflows.state import WorkflowState
 
 logging.basicConfig(
@@ -22,6 +23,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("IssueOps starting — confidence_threshold=%.2f", settings.confidence_threshold)
+    init_omium(
+        api_key=settings.omium_api_key,
+        api_base_url=settings.omium_api_url or None,
+    )
     yield
     logger.info("IssueOps shutting down")
 
@@ -81,6 +86,7 @@ async def _run_workflow(initial_state: WorkflowState) -> None:
             initial_state["issue_title"],
         )
 
+        await create_run(issue_id, initial_state["issue_title"])
         result = await workflow.ainvoke(initial_state)
 
         elapsed = time.monotonic() - start

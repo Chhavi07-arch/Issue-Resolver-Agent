@@ -1,6 +1,6 @@
 """Pydantic schemas for the Fix PR agent output."""
 
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -61,3 +61,23 @@ class FixResult(BaseModel):
         description="True only when the fix is specific, grounded, and safe to apply",
         default=False,
     )
+
+
+class LineAnchoredEdit(BaseModel):
+    """Edit specified by line numbers. The system extracts find_snippet from the file."""
+
+    path: str = Field(description="Relative file path")
+    start_line: int = Field(ge=1, description="First line to replace (1-based, from NNN | prefix)")
+    end_line: int = Field(ge=1, description="Last line to replace (1-based, inclusive)")
+    replace_with: str = Field(description="Corrected code (no NNN | prefixes)")
+    change_summary: str = Field(default="", description="One sentence: what this edit does")
+
+
+class LinePatchResult(BaseModel):
+    """Mode B patch output: line-anchored edits extracted from numbered file listing."""
+
+    patch_plan: str
+    edits: List[LineAnchoredEdit] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
+    validation_notes: str = Field(default="")
+    ready_for_pr: bool = Field(default=False)

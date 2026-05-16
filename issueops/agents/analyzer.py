@@ -7,6 +7,7 @@ from typing import Any
 
 from issueops.config.settings import settings
 from issueops.schemas.analysis import IssueAnalysis, IssueSeverity, IssueType
+from issueops.tools.omium_tracing import checkpoint, trace
 from issueops.workflows.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,7 @@ def _analyze_heuristic(state: WorkflowState) -> IssueAnalysis:
 # Agent entry point
 # ---------------------------------------------------------------------------
 
+@trace("analyze_issue")
 async def analyze_issue(state: WorkflowState) -> dict[str, Any]:
     """Classify issue type, severity, and extract structured metadata.
 
@@ -137,4 +139,6 @@ async def analyze_issue(state: WorkflowState) -> dict[str, Any]:
         len(analysis.keywords), len(analysis.suspected_files), len(analysis.stack_traces),
     )
 
-    return {"analysis": analysis.model_dump(), "current_step": "analyzed"}
+    result = {"analysis": analysis.model_dump(), "current_step": "analyzed"}
+    await checkpoint("after_issue_parsing")
+    return result

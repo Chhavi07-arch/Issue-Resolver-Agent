@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 from issueops.tools import github as gh
+from issueops.tools.omium_tracing import checkpoint, trace
 from issueops.workflows.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -650,6 +651,7 @@ def _find_chain_files(
 # Agent entry point
 # ---------------------------------------------------------------------------
 
+@trace("gather_repo_context")
 async def gather_repo_context(state: WorkflowState) -> dict[str, Any]:
     """Gather repository evidence using structure-aware retrieval.
 
@@ -901,4 +903,6 @@ async def gather_repo_context(state: WorkflowState) -> dict[str, Any]:
         len(related_issues), subsystems, framework, repo_context["partial"],
     )
 
-    return {"repo_context": repo_context, "current_step": "repo_context_gathered"}
+    result = {"repo_context": repo_context, "current_step": "repo_context_gathered"}
+    await checkpoint("after_repo_context")
+    return result

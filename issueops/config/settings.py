@@ -35,6 +35,7 @@ class Settings(BaseSettings):
 
     # Observability (optional)
     omium_api_key: str = ""
+    omium_api_url: str = ""
 
     # HTTP
     http_timeout: float = 20.0
@@ -44,6 +45,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     default_base_branch: str = "main"
     live_writes_enabled: bool = False
+    allow_diagnosis_only_pr: bool = False
 
     @property
     def llm_available(self) -> bool:

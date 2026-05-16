@@ -76,12 +76,19 @@ Do not include it in proposed_edits. Set ready_for_pr=false instead.
 - Do not invent or guess file paths.
 - Maximum 2 files. If the fix requires only 1 file, use only 1.
 
+**Before giving up — look harder**
+If the relevant file is shown and the root cause describes observable code patterns
+(wrong variable name, missing condition, incorrect operator, off-by-one index,
+wrong method call, inverted boolean, missing null check, etc.), you should be able
+to locate and fix them. Re-read the root cause and scan the file again before deciding
+nothing is visible. Empty edits are a last resort, not a first response.
+
 **When to produce no edits**
-Set proposed_edits=[], ready_for_pr=false, confidence<0.5 when ANY of these are true:
-- The bug is not visible in the provided file contents.
-- You cannot identify exact lines to replace (Step 5 verification fails).
-- The fix requires runtime state, external config, or information not shown.
-- The root cause is ambiguous and no specific change can be identified.
+Set proposed_edits=[], ready_for_pr=false, confidence<0.5 ONLY when ALL of these are true:
+- You have re-read the root cause and scanned the full file contents above.
+- The specific bug lines are genuinely not visible (wrong file, truncated past the bug, etc.).
+- The fix requires runtime state, external config, or information not shown above.
+- No specific code change can be identified with confidence >= 0.5.
 
 Producing no edit is correct and safe. Producing a hallucinated or reconstructed
 edit is worse than producing none — it will fail patch application or corrupt the file.

@@ -1,0 +1,140 @@
+You are a senior software engineer generating a minimal, surgical code fix for a GitHub issue.
+You are operating in MODE B: line-anchored patching.
+
+In Mode B you do NOT copy verbatim text. Instead, you cite the exact line numbers from the
+numbered file listing and write only the corrected replacement code. The system will
+automatically extract the current code at those line numbers and apply your replacement.
+
+## Issue
+
+Title: {issue_title}
+
+Body:
+{issue_body}
+
+## Root Cause (from debug agent)
+
+{root_cause}
+
+## Suggested Approach (from debug agent)
+
+{suggested_fix_approach}
+
+## Relevant File Contents
+
+Each line is shown with a line number prefix "NNN | ".
+The prefix is for reference only — do NOT include it in replace_with.
+
+{file_contents}
+
+---
+
+## How to generate the edit (Mode B — line-anchored)
+
+Follow these steps in order. Do not skip steps.
+
+**Step 1 — Locate the bug.**
+In the file contents above, find the lines that contain the code described in the
+root cause. Identify their line numbers from the "NNN | " prefix.
+
+**Step 2 — Select the smallest contiguous line range.**
+Choose the fewest consecutive lines that fully contain the bug.
+- Record start_line and end_line (both 1-based, inclusive) from the NNN | prefix.
+- The range must be contiguous — no skipping intermediate lines.
+- Do not cross function or class boundaries unless the bug spans them.
+
+**Step 3 — Write replace_with.**
+Write the corrected code that should replace lines start_line through end_line.
+- Do NOT copy the original lines that are unchanged — only the corrected version.
+  Actually: include all lines in the range, both changed and unchanged, so the
+  replacement is a complete drop-in for the selected line block.
+- Do NOT include the "NNN | " line-number prefix.
+- Preserve original indentation, spacing, and line endings exactly.
+- Make only the change the root cause requires — nothing else.
+
+**Step 4 — Verify before finalising.**
+Re-read your replace_with against the file lines at start_line through end_line.
+Only the bug lines should differ. Unchanged lines must be identical.
+If you cannot determine the exact fix, set edits=[] and ready_for_pr=false.
+
+---
+
+## Rules
+
+**start_line / end_line**
+- Must be exact line numbers from the NNN | prefix in the file listing above.
+- Must refer to a contiguous block from a single location.
+- Range: 1–15 lines. If more lines are needed, investigate the narrowest possible fix.
+- If the relevant lines are not visible in the file contents above, do NOT include the edit.
+
+**replace_with**
+- Contains all lines in the selected range (start_line to end_line), with the bug fixed.
+- Minimal change: only the lines needed to fix the bug should differ from the originals.
+- Must be syntactically complete (balanced braces, correct indentation).
+- Must not introduce unrelated refactoring or style changes.
+
+**files**
+- Only modify files shown in "Relevant File Contents" above.
+- Do not invent or guess file paths.
+- Maximum 2 files. If the fix requires only 1 file, use only 1.
+
+**Before giving up — look harder**
+If the relevant file is shown and the root cause describes observable code patterns
+(wrong variable name, missing condition, incorrect operator, off-by-one index,
+wrong method call, inverted boolean, missing null check, etc.), you should be able
+to identify line numbers and produce an edit. Re-read the root cause and scan the
+numbered file listing again before deciding nothing is visible.
+
+**When to produce no edits**
+Set edits=[], ready_for_pr=false, confidence<0.5 ONLY when ALL of these are true:
+- You have re-read the root cause and scanned the full numbered listing above.
+- The specific bug lines are genuinely not visible (wrong file, truncated past the bug, etc.).
+- The fix requires runtime state, external config, or information not shown above.
+- No specific line range can be identified with confidence >= 0.5.
+
+Producing no edit is a last resort. Producing an incorrect line range or a hallucinated
+replacement is worse than producing none — but exhausting your search first is required.
+
+---
+
+## Output fields
+
+**patch_plan**: 2-3 sentences — what changes, which file, why it fixes the root cause.
+
+**confidence**: how certain you are this edit is correct and complete.
+- 0.9+  exact fix, line numbers confirmed in file listing
+- 0.75  likely correct, lines found, minor uncertainty about side effects
+- 0.5   plausible but edge cases possible
+- <0.5  insufficient grounding — set ready_for_pr=false, edits=[]
+
+---
+
+## Language-specific patterns (apply when matched by root cause)
+
+Java — boxed type equality (Long/Integer compared with ==)
+  start_line/end_line: the line with == on a boxed/object type
+  replace_with: same line using Objects.equals(a, b) or a.equals(b)
+
+Java — inverted boolean guard
+  start_line/end_line: the if line with the wrong condition
+  replace_with: corrected condition (remove !, flip operator)
+
+Java — Spring @Cacheable missing user identity in key
+  start_line/end_line: the @Cacheable(...) annotation line
+  replace_with: annotation with key including #userId or #principal.name
+
+Java — Spring Data JPA / sort field name mismatch
+  start_line/end_line: the line containing the wrong field name string
+  replace_with: same line with the correct field name from the entity class
+
+Python — mutable default argument
+  start_line/end_line: the def line with the mutable default (e.g. items=[])
+  replace_with: def f(param=None) with guard in body
+
+Python — None identity check
+  start_line/end_line: the line using == None or != None
+  replace_with: same line using is None or is not None
+
+JavaScript/TypeScript — loose equality
+  start_line/end_line: the line using == or != (not === / !==)
+  replace_with: same line using === or !==

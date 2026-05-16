@@ -9,11 +9,13 @@ from issueops.agents.debug import debug_root_cause
 from issueops.agents.fix_pr import escalate_to_comment, generate_fix_and_pr
 from issueops.agents.planner import plan
 from issueops.agents.repo_context import gather_repo_context
+from issueops.tools.omium_tracing import trace
 from issueops.workflows.state import WorkflowState
 
 logger = logging.getLogger(__name__)
 
 
+@trace("confidence_router")
 def confidence_router(state: WorkflowState) -> str:
     """Route to fix or escalate based on debug agent confidence."""
     from issueops.config.settings import settings

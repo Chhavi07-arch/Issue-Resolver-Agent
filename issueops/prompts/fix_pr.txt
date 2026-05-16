@@ -58,6 +58,61 @@ Do not include it in proposed_edits. Set ready_for_pr=false instead.
 
 ---
 
+## CRITICAL — common mistake to avoid
+
+The single most common failure is appending your fix AFTER the original lines
+instead of REPLACING the buggy line(s) with the fixed version. Read this twice.
+
+### [BAD] — DO NOT DO THIS
+
+Suppose the buggy code is:
+
+```
+  42 |     user_input = request.get("input")
+  43 |     result = user_input.strip().lower()
+```
+
+A wrong response is:
+
+  find_snippet:
+      user_input = request.get("input")
+      result = user_input.strip().lower()
+
+  replace_with:
+      user_input = request.get("input")
+      result = user_input.strip().lower()
+      if user_input is None:
+          return ""
+
+This is WRONG. The guard runs AFTER the crash on line 43. You kept the original
+buggy lines unchanged AND appended new code after them — that doubles the
+context instead of fixing the bug, and the patch will be rejected.
+
+### [GOOD] — DO THIS
+
+  find_snippet:
+      user_input = request.get("input")
+      result = user_input.strip().lower()
+
+  replace_with:
+      user_input = request.get("input")
+      if user_input is None:
+          return ""
+      result = user_input.strip().lower()
+
+This is CORRECT. The guard is inserted IN ITS RIGHT POSITION (between the two
+original lines, before the line that crashes). `replace_with` is a complete
+drop-in for `find_snippet` — what those lines should look like AFTER the fix.
+
+### The rule
+
+`replace_with` is what the lines look like AFTER the fix. Not "original plus
+fix" — just "fixed version of the same range." If you find yourself starting
+`replace_with` with the exact text of `find_snippet`, stop and re-think where
+the change actually needs to land.
+
+---
+
 ## Rules
 
 **find_snippet**

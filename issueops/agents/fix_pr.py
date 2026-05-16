@@ -19,7 +19,7 @@ from issueops.tools import github as gh
 from issueops.tools.bug_detectors import detect_in_file
 from issueops.tools.patch_builder import apply_edit_to_content, apply_and_diff, line_anchored_to_file_edit
 from issueops.tools.patch_validator import diff_size_ok, validate_fix_result
-from issueops.tools.patch_syntax import check_brace_balance, validate_replacement_syntax
+from issueops.tools.patch_syntax import check_brace_balance, recover_from_prepend, validate_replacement_syntax
 from issueops.tools.patch_verifier import verify_patch
 from issueops.tools.omium_tracing import checkpoint, trace
 from issueops.tools.symbol_search import extract_context_around_line, find_definition_line
@@ -116,6 +116,7 @@ def _format_file_contents(
 async def _generate_fix_with_llm(
     state: WorkflowState,
     repo_context: dict[str, Any] | None = None,
+    prior_error: str | None = None,
 ) -> FixResult:
     from issueops.tools.llm import generate_structured
 
@@ -142,6 +143,29 @@ async def _generate_fix_with_llm(
         .replace("{suggested_fix_approach}", fix_approach)
         .replace("{file_contents}", file_contents_text)
     )
+
+    # Retry feedback: when Mode A is being re-run after a validation failure,
+    # surface the specific rejection reason and reiterate the format rule the
+    # model is most likely to have violated. This is the Aider-style feedback
+    # loop — one targeted retry recovers a high fraction of format failures.
+    if prior_error:
+        prompt += (
+            "\n\n---\n\n"
+            "## RETRY — your previous response was rejected\n\n"
+            f"**Rejection reason:** {prior_error}\n\n"
+            "Re-read the **CRITICAL — common mistake to avoid** section above. "
+            "The single most common cause of rejection is this pattern:\n\n"
+            "- `find_snippet` contains the buggy lines.\n"
+            "- `replace_with` contains the SAME buggy lines AND the fix appended after.\n\n"
+            "That doubles the buggy code instead of replacing it. `replace_with` must be a "
+            "**complete drop-in replacement** for `find_snippet` — the lines as they should "
+            "look AFTER the fix is applied, with the bug actually removed or corrected in place.\n\n"
+            "If the fix is to insert a guard *before* the buggy line, the guard must appear "
+            "*before* the buggy line in `replace_with`, with the buggy line still present "
+            "(unchanged) after it. Do NOT include the original buggy line plus a separate "
+            "fixed version.\n\n"
+            "Produce a corrected edit now. If you cannot, return an empty `proposed_edits` list."
+        )
 
     return await generate_structured(prompt, FixResult)
 
@@ -347,6 +371,25 @@ def _run_validation(
 
             # Syntax / structural gate — runs before any file I/O
             syntax_ok, syntax_note = validate_replacement_syntax(edit)
+
+            # Prepend false-positive recovery: append-after-match is a legitimate
+            # edit shape that the static detector cannot distinguish from a
+            # duplicate-then-correct bug. Apply the patch and verify the result.
+            if not syntax_ok and syntax_note.startswith("[prepend]"):
+                recovered_ok, recover_note = recover_from_prepend(edit, content)
+                if recovered_ok:
+                    logger.info(
+                        "[PATCH_RECOVERY] [prepend] recovered as insertion for %s — %s",
+                        edit.path, recover_note,
+                    )
+                    syntax_ok = True
+                    syntax_note = f"[recovered_prepend] {recover_note}"
+                else:
+                    logger.warning(
+                        "[PATCH_RECOVERY] [prepend] recovery failed for %s — %s",
+                        edit.path, recover_note,
+                    )
+
             if not syntax_ok:
                 all_valid = False
                 validation_issues.append(f"{edit.path}: {syntax_note}")
@@ -500,6 +543,51 @@ async def _enrich_snippets_with_debug_files(
         return repo_context
 
     return {**repo_context, "file_snippets": snippets}
+
+
+# ---------------------------------------------------------------------------
+# Diff-substance accounting (no-op guard)
+# ---------------------------------------------------------------------------
+
+# Bracket/punctuation-only fragments that don't represent a real code change
+_TRIVIAL_DIFF_BODIES: frozenset[str] = frozenset({
+    "{", "}", "(", ")", "[", "]",
+    "});", "},", "};", "),", ");",
+    "})", ")", "]", "[",
+    "pass", "...", ":",
+})
+
+
+def _count_substantive_diff_lines(diff_text: str) -> int:
+    """Count +/- lines in a unified diff that represent a real code change.
+
+    Excludes:
+      - the file header lines (``+++ a/x``, ``--- b/x``)
+      - whitespace-only changes
+      - comment-only lines (Python ``#``, JS/Java ``//``)
+      - bracket/punctuation-only lines (``}``, ``});``, etc.)
+
+    Used by the no-op guard: when the debug agent reported high diagnosis
+    confidence in a real bug (e.g. add a None-guard, fix a None equality),
+    the resulting diff must change real code lines, not just merge whitespace.
+    A trivial diff under a confident diagnosis is almost always a fallback
+    mode shipping cosmetic noise instead of the actual fix.
+    """
+    count = 0
+    for line in diff_text.splitlines():
+        if not line or line[0] not in ("+", "-"):
+            continue
+        if line.startswith(("+++", "---")):
+            continue
+        body = line[1:].strip()
+        if not body:
+            continue
+        if body in _TRIVIAL_DIFF_BODIES:
+            continue
+        if body.startswith("#") or body.startswith("//"):
+            continue
+        count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -789,10 +877,28 @@ async def _execute_writes(
         base_branch = await gh.get_default_branch(owner, repo)
         logger.info("FixPR writes: base_branch=%s", base_branch)
 
-        # 2. Create feature branch
+        # 2. Resolve a non-colliding branch name (handles reopen-to-retest workflows
+        # where a previous run already created issueops/fix-issue-N). The resolver
+        # auto-appends -v2/-v3/... and updates the PR title to reflect the iteration.
+        resolved_branch = await gh.find_available_branch_name(owner, repo, branch_name)
+        if resolved_branch != branch_name:
+            logger.info(
+                "FixPR writes: branch '%s' already exists — using '%s' instead",
+                branch_name, resolved_branch,
+            )
+            branch_name = resolved_branch
+            pr_meta = {**pr_meta, "branch": resolved_branch}
+            # Reflect iteration in the PR title so the new draft is distinguishable
+            # from prior attempts in the GitHub UI.
+            suffix = resolved_branch.rsplit("-", 1)[-1]
+            if suffix.startswith("v") and suffix[1:].isdigit():
+                base_title = pr_meta.get("pr_title", "")
+                pr_meta = {**pr_meta, "pr_title": f"{base_title} ({suffix})"}
+
+        # 3. Create feature branch
         await gh.create_branch(owner, repo, base_branch, branch_name)
 
-        # 3. Apply each validated edit to the full file and commit
+        # 4. Apply each validated edit to the full file and commit
         for edit in fix_result.proposed_edits:
             # Re-fetch full content — repo_context copy may be truncated
             full_content = await gh.get_file_contents(owner, repo, edit.path)
@@ -829,7 +935,7 @@ async def _execute_writes(
                 branch_name, pr_meta["commit_message"],
             )
 
-        # 4. Open draft PR
+        # 5. Open draft PR
         pr_data = await gh.create_draft_pr(
             owner, repo,
             pr_meta["pr_title"], pr_meta["pr_body"],
@@ -838,7 +944,7 @@ async def _execute_writes(
         pr_url: str = pr_data.get("html_url", "")
         pr_number: int = pr_data.get("number", 0)
 
-        # 5. Comment on original issue
+        # 6. Comment on original issue
         comment_data = await gh.comment_on_issue(
             owner, repo, issue_id, _build_success_comment(fix_result, pr_url)
         )
@@ -965,6 +1071,50 @@ async def generate_fix_and_pr(state: WorkflowState) -> dict[str, Any]:
         else:
             fix_result = raw_fix
 
+        # --- 2b. Mode A retry: feed the validation error back and try once more ---
+        # Aider-style feedback loop. Only worth attempting when Mode A produced
+        # edits that failed validation (vs returning no edits at all) — otherwise
+        # the retry has no anchor and Mode B is a better next step.
+        if (
+            not fix_result.ready_for_pr
+            and use_llm
+            and llm_succeeded
+            and raw_fix.proposed_edits
+        ):
+            retry_error = fix_result.validation_notes or "(no specific reason)"
+            logger.info(
+                "[PATCH_RETRY] mode=A failed — retrying once with feedback: '%s'",
+                retry_error[:120],
+            )
+            try:
+                retry_raw = await _generate_fix_with_llm(
+                    state, repo_context, prior_error=retry_error
+                )
+                if retry_raw.proposed_edits:
+                    retry_fix_result, retry_diffs = _run_validation(retry_raw, repo_context)
+                    if retry_fix_result.ready_for_pr:
+                        logger.info(
+                            "[PATCH_RETRY] mode=A retry succeeded — confidence=%.2f",
+                            retry_fix_result.confidence,
+                        )
+                        fix_result, diffs_final = retry_fix_result, retry_diffs
+                    else:
+                        logger.info(
+                            "[PATCH_RETRY] mode=A retry also failed: %s",
+                            retry_fix_result.validation_notes[:120],
+                        )
+                else:
+                    logger.info("[PATCH_RETRY] mode=A retry produced no edits")
+            except Exception as exc:
+                exc_name = type(exc).__name__
+                if "ValidationError" in exc_name or "validation_error" in exc_name.lower():
+                    logger.warning("[PATCH_SCHEMA_FAIL] mode=A retry schema validation failed: %s", exc)
+                else:
+                    logger.warning(
+                        "[PATCH_RETRY] mode=A retry errored (%s: %s) — falling through to mode=B",
+                        exc_name, exc,
+                    )
+
         # --- 1c. Stage B fallback: line-anchored patching ---
         if not fix_result.ready_for_pr and use_llm:
             logger.info("[PATCH_MODE] mode=A failed, trying mode=B (line-anchored)")
@@ -1016,6 +1166,34 @@ async def generate_fix_and_pr(state: WorkflowState) -> dict[str, Any]:
                     "[PATCH_RETRY_REASON] diagnosis_confidence=%.2f < threshold=%.2f — Mode C not attempted",
                     _diag_conf, settings.confidence_threshold,
                 )
+
+    # --- 2c. No-op guard: reject trivially small patches under a confident diagnosis ---
+    # When the debug agent identified a specific real bug with high confidence,
+    # shipping a 1-2 line cosmetic change is worse than escalating. This blocks
+    # the failure mode where Mode B / Mode C ship a near-no-op just to satisfy
+    # the validator after the actually-correct Mode A edit was rejected.
+    if fix_result.ready_for_pr and diffs_final:
+        debug_state = state.get("debug_result") or {}
+        diagnosis_confidence = debug_state.get("diagnosis_confidence", 0.0)
+        if diagnosis_confidence >= 0.75:
+            sub_lines = sum(
+                _count_substantive_diff_lines(d) for d in diffs_final.values()
+            )
+            if sub_lines < 3:
+                logger.warning(
+                    "[PATCH_NOOP_GUARD] diagnosis_confidence=%.2f but diff has only %d "
+                    "substantive line(s) — refusing to ship a trivial patch; escalating instead",
+                    diagnosis_confidence, sub_lines,
+                )
+                fix_result = fix_result.model_copy(update={
+                    "ready_for_pr": False,
+                    "validation_notes": (
+                        (fix_result.validation_notes + " | " if fix_result.validation_notes else "")
+                        + f"NOOP_GUARD: diff has {sub_lines} substantive line(s); "
+                        f"diagnosis_confidence={diagnosis_confidence:.2f} requires >=3"
+                    ),
+                })
+                diffs_final = {}
 
     logger.info(
         "FixPR: validation done — ready_for_pr=%s diffs=%d notes='%s'",

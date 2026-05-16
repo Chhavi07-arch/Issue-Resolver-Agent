@@ -302,6 +302,72 @@ def validate_replacement_syntax(edit: FileEdit) -> tuple[bool, str]:
     return True, "ok"
 
 
+# ─── Recovery — [prepend] false-positive ─────────────────────────────────────
+
+def recover_from_prepend(edit: FileEdit, content: str) -> tuple[bool, str]:
+    """Attempt to rehabilitate an edit that failed the [prepend] check.
+
+    The prepend detector fires whenever ``replace_with`` begins with
+    ``find_snippet`` and is at least 10 chars longer. Two distinct LLM behaviours
+    produce this pattern:
+
+      (a) Append-after-match (intentional): the model wants to insert new code
+          immediately after the matched block. Applying the patch produces a
+          structurally valid file — the matched lines stay, new code is added
+          after them. This is a legitimate edit shape.
+
+      (b) Duplicate-then-correct (genuinely broken): the model emitted the
+          original lines AND a corrected copy. The resulting file is corrupt.
+
+    Distinguishing (a) from (b) statically is unreliable. Instead, we apply the
+    patch and verify the *output* with the same per-language structural checks
+    used elsewhere: Python AST parse for ``.py``, brace balance for braced
+    languages. Output that parses cleanly is accepted as recovery.
+
+    Returns (recovered_ok, human_readable_note). Caller should only invoke this
+    after ``validate_replacement_syntax`` returns a ``[prepend]`` failure.
+    """
+    from issueops.tools.patch_match import find_snippet as _find_snippet
+
+    # Anti-pattern: replace_with literally contains find_snippet more than
+    # once. This means the model duplicated the original block (with or
+    # without modifications inside the second copy). Even if the resulting
+    # file parses, it doubles the buggy logic. Reject before applying.
+    if edit.replace_with.count(edit.find_snippet) > 1:
+        return False, (
+            "recovery rejected: replace_with contains find_snippet more than "
+            "once — the model duplicated the original block instead of inserting "
+            "new code after it"
+        )
+
+    match = _find_snippet(edit.find_snippet, content)
+    if match is None:
+        return False, "recovery aborted: could not locate find_snippet in content"
+
+    patched = content.replace(match.matched_text, edit.replace_with, 1)
+
+    lang = _language(edit.path)
+
+    if lang == "python":
+        try:
+            ast.parse(patched)
+            return True, "post-apply Python AST parse ok"
+        except IndentationError as exc:
+            return False, f"post-apply Python indentation error on line {exc.lineno}: {exc.msg}"
+        except SyntaxError as exc:
+            return False, f"post-apply Python syntax error on line {exc.lineno}: {exc.msg}"
+
+    if _ext(edit.path) in _BRACE_SCOPED_EXTS:
+        balanced_ok, balance_note = check_brace_balance(content, patched, edit.path)
+        if not balanced_ok:
+            return False, f"post-apply check failed: {balance_note}"
+        return True, "post-apply brace balance ok"
+
+    # No structural post-apply check available for this language — accept
+    # conservatively. The downstream diff-size check still bounds blast radius.
+    return True, "no per-language post-apply check available; accepted on diff-size guard only"
+
+
 # ─── Public API — post-apply balance check ───────────────────────────────────
 
 def check_brace_balance(

@@ -6,6 +6,14 @@ IssueOps receives a GitHub issue webhook, reasons about the codebase, diagnoses 
 
 ---
 
+
+## Developed By
+
+- [Chhavi](https://github.com/chhavi07-arch)
+- [Sanaa Ara](https://github.com/sanaa-duhh)
+
+---
+
 ## The Problem
 
 Engineering teams spend hours triaging issues before a single line of code changes:
@@ -496,13 +504,14 @@ issueops/
 
 ---
 
+
+
 ## Credits
 
 Built for the Omium Hackathon.
 
 | | |
 |---|---|
-| Engineering | *[your name here]* |
 | Observability sponsor | [Omium](https://omium.ai) |
 
 ---
